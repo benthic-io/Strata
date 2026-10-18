@@ -34,6 +34,38 @@ The two B60 rows ran `6f32ec0` plus two small `sycl/` fixes (the compile fix and
 `xe`, Level Zero V2, NEO 26.09.37435.12 and oneAPI 2026.1.1, without Docker. Host: Ryzen 5 5600, 64 GB RAM, PCIe 3.0 x8 per card.
 Full flags, per-request timings and engine logs are in the report linked in the table.
 
+## Integrated GPUs (a UHD 770 and the other Intel iGPUs)
+
+`./setup.sh --backend sycl` finds an **integrated** part as well as a discrete Arc, and runs it through the same
+i915 path an Arc A750 takes. It is recognised by where it sits, not by its id: Intel puts the platform's own
+graphics at **PCI 00:02.0** on every client part, and a discrete card hangs off a PCIe bridge. Its memory BARs do
+not tell it apart - a UHD 770 publishes the same 4 GiB aperture an Arc does. `STRATA_EXPERIMENTAL_INTEL_IGPU=1` takes
+any other 8086 id as integrated, the same opt-in the AMD APU ids use.
+
+An iGPU has no VRAM of its own, so:
+
+- it is sized from the **shared pool** (half the RAM, less the OS's share - setup.py's APU rule), and setup does not
+  count that as room *beside* the RAM: `--check` says every size "fits, the experts the card does not hold are
+  computed on the CPU";
+- the experts live in a **RAM arena** and the CPU computes the ones the GPU does not hold (`STRATA_VERIFY_NO_HOST=0`),
+  so the GPU's own memory holds only the dense weights, the KV and the prompt buffers;
+- FP64 is emulated, as on the A-series (`IGC_EnableDPEmulation=1`, `OverrideDefaultFP64Settings=1`);
+- the n-gram table (28.8 GB) is only locked in RAM when the RAM has room for it beside the arena; otherwise it is
+  read from the SSD, and setup says so;
+- it is **not** given the small-card 300 MiB reserve, which is advice for a card with real VRAM;
+- `strata-sycl.sh` runs the engine **without Docker** when the machine has none (or `STRATA_SYCL_NATIVE=1`), sourcing
+  oneAPI's `setvars.sh` and rewriting the config's `/work` paths - an iGPU is usually a desktop where installing
+  Docker is the larger ask.
+
+**What this costs.** The GPU is the small part: on a UHD 770 the engine keeps under 4 GiB of experts (the driver's cap
+on a single allocation, which `--expert-cache auto` now respects) and the CPU computes the rest, so the speed is a CPU
+number with the dense projections, the attention and the sampling offloaded to the iGPU. The 50-kernel parity suite
+passes on a UHD 770 except `gr_parity`'s fused q8_1 path (not built for the port), `iq_parity`'s Q3_K multi-column
+mmvq and `s2_expert_grouped_parity` (both known port items). End-to-end decode on an iGPU is **not measured yet** -
+that needs a Flash-Next download on the machine, and the 35B `qwen35moe` family is CUDA/HIP only.
+
+**Not supported:** an iGPU that the Level Zero runtime does not list (`sycl-ls` shows nothing), and Windows.
+
 ## What was tested here (0.1.39)
 
 - **Compiles:** Ubuntu 24.04 (WSL2), Intel oneAPI DPC++ 2026.1.1 + oneMKL 2026.1. The whole `sycl/` project
@@ -49,8 +81,8 @@ Full flags, per-request timings and engine logs are in the report linked in the 
   The HIP build is not affected (the option is off by default).
 
 **Not tested by anyone yet:** Windows (no native build path; see below), Arc on WSL2 for the 0.1.39 port, the Alchemist
-A-series, integrated Arc GPUs (the B390 / Panther Lake in #515; the shared-memory planning does not exist yet), and
-images (not wired on Intel).
+A-series, and images (not wired on Intel). Integrated GPUs are described above: they run and their kernel parity is
+measured, but no end-to-end decode number exists yet.
 
 ## What you need
 
