@@ -34,7 +34,7 @@
 //    operation with no intermediate rounding and land one ulp away from the host.
 //
 //    THE `d` IN THOSE NAMES IS NOT COSMETIC.  The first version wrote `__fadd_rn`/`__fmul_rn`, which are
-//    the SINGLE-precision intrinsics: the compiler converted each double operand to float, operated
+//    the SINGLE-precision intrinsics: the compiler converted each float operand to float, operated
 //    there, and converted back, so the whole pooling arithmetic ran in single precision - `ss` held only
 //    float precision (121.82236480712891 on the device against 121.82236342931094 in the reference).
 //    Every comparison still passed at any sane tolerance, the spare key landing 0.4 f32 ulp away; only a
@@ -159,7 +159,7 @@ kv_append_kernel(uint16_t *__restrict__ k_pool, uint16_t *__restrict__ v_pool,
 // ================= 2. indexer_key_append =================
 
 /// Appends the raw key, and on a block completion pools AND ROTATES the pooled row.  One thread per indexer
-/// dim, shared `mean` in double.
+/// dim, shared `mean` in float.
 ///
 /// **THE ROTATION IS INSIDE THIS KERNEL, AND THAT IS WHAT MAKES THE WHOLE FUNCTION CAPTURABLE.**  It used to be
 /// a second launch from the host wrapper, guarded by `if (pos % idx_block == idx_block - 1)` - a HOST branch on
@@ -175,7 +175,7 @@ __dpct_inline__ void indexer_key_append_kernel(
     const float *__restrict__ sin_tab, const int32_t *__restrict__ mtab,
     uint8_t *dpct_local) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    auto s_mean = (double *)dpct_local; // idx_dim doubles
+    auto s_mean = (float *)dpct_local; // idx_dim doubles
     const int d = item_ct1.get_local_id(2);
     /*
     DPCT1098: The '*' expression is used instead of the __ldg call. These
@@ -192,8 +192,8 @@ __dpct_inline__ void indexer_key_append_kernel(
     // The spare slot's key is `rms_norm(raw[0])`, which is CONSTANT for the sequence and is the only reason
     // cell 0's raw key has to be kept: the three-row tail no longer holds it after the first block.
     if (pos == 0) {
-        double p = (double) raw[d];
-        double ss = 0.0;
+        float p = (float) raw[d];
+        float ss = 0.0;
         // Same order as the pooled path, so the two are comparable: sum of squares over the dims, sequential.
         // Every thread computes the same `ss` and uses only its own output element.
         //
@@ -203,7 +203,7 @@ __dpct_inline__ void indexer_key_append_kernel(
         // key comes out 0.4 f32 ulp away - close enough that only a BIT-EXACT assertion notices.  `__ddiv_rn`
         // and `__dsqrt_rn` pin the reciprocal square root for the same reason.
         for (int i = 0; i < idx_dim; ++i) {
-            const double v = (double) raw[i];
+            const float v = (float) raw[i];
             /*
             DPCT1013: The rounding mode could not be specified and the
             generated code may have different accuracy than the original code.
@@ -218,8 +218,8 @@ __dpct_inline__ void indexer_key_append_kernel(
         correctness. SYCL math built-in function rounding mode is aligned with
         OpenCL C 1.2 standard.
         */
-        const double inv = 1.0 / sycl::sqrt(ss / (double)idx_dim + (double)eps);
-        float y = (float) (p * inv * (double) w_k_norm[d]);
+        const float inv = 1.0 / sycl::sqrt(ss / (float)idx_dim + (float)eps);
+        float y = (float) (p * inv * (float) w_k_norm[d]);
         // The spare rotates at position 0 - ALWAYS row 0 of the table, whatever `pos_base` is, as the native
         // indexer's spare does.  At angle 0 the sine is exactly 0 in every scaling (sin(0) * mscale), so the
         // pair rotation reduces to `v * cos_tab[pair]` with no partner element to read (and no barrier).
@@ -243,9 +243,9 @@ __dpct_inline__ void indexer_key_append_kernel(
                         // written above
 
     // The mean of this block's r raw keys, in CELL order: the r-1 tail rows (slots 0..r-2) then the incoming
-    // cell (slot r-1).  The sum of r f32 values is exact in double, so the mean's order cannot matter here -
+    // cell (slot r-1).  The sum of r f32 values is exact in float, so the mean's order cannot matter here -
     // but the order of the SUM OF SQUARES below can, and it is fixed to d ascending on both sides.
-    double m = 0.0;
+    float m = 0.0;
     /*
 DPCT1013: The rounding mode could not be specified and the generated code
 may have different accuracy than the original code. Verify the correctness. SYCL
@@ -253,15 +253,15 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
 */
 #pragma unroll
     for (int j = 0; j < r - 1; ++j)
-        m = m + (double)tail[(size_t)j * idx_dim + d];
+        m = m + (float)tail[(size_t)j * idx_dim + d];
     /*
     DPCT1013: The rounding mode could not be specified and the generated
     code may have different accuracy than the original code. Verify the
     correctness. SYCL math built-in function rounding mode is aligned with
     OpenCL C 1.2 standard.
     */
-    m = m + (double)raw[d];
-    m = m / (double) r;
+    m = m + (float)raw[d];
+    m = m / (float) r;
     s_mean[d] = m;
     /*
     DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -270,7 +270,7 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
     */
     item_ct1.barrier();
 
-    double ss = 0.0;
+    float ss = 0.0;
     /*
 DPCT1013: The rounding mode could not be specified and the generated code
 may have different accuracy than the original code. Verify the correctness. SYCL
@@ -284,10 +284,10 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
     correctness. SYCL math built-in function rounding mode is aligned with
     OpenCL C 1.2 standard.
     */
-    const double inv = 1.0 / sycl::sqrt(ss / (double)idx_dim + (double)eps);
+    const float inv = 1.0 / sycl::sqrt(ss / (float)idx_dim + (float)eps);
 
     const int b = pos / r;
-    pooled[(size_t) b * idx_dim + d] = (float) (m * inv * (double) w_k_norm[d]);
+    pooled[(size_t) b * idx_dim + d] = (float) (m * inv * (float) w_k_norm[d]);
     // The spare slot MOVES to b+1 and is rewritten with the same constant value.
     pooled[(size_t) (b + 1) * idx_dim + d] = dead[d];
     // The rotation position for this row, kept because a capture reader and the debug dumps want it.  It is the
@@ -342,7 +342,7 @@ __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
     */
     const long long n_kv = (long long)*(step + kStepNKv);
     auto &s_dot =
-        *sycl::ext::oneapi::group_local_memory_for_overwrite<double[32]>(
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const long long b = item_ct1.get_group(2);
     // A BLOCK PAST THE COMPLETED-BLOCK COUNT MUST DO NOTHING.  This is what lets the LAYER launch a CONSTANT
@@ -356,7 +356,7 @@ __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
     if (wid == 0) s_dot[lane] = 0.0;     // thread 0 reads all idx_n_head entries; zero the unused ones
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
-    double acc = 0.0;
+    float acc = 0.0;
 #pragma unroll
     for (int d = lane; d < idx_dim; d += 32)
         /*
@@ -365,8 +365,8 @@ __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
         correctness. SYCL math built-in function rounding mode is aligned with
         OpenCL C 1.2 standard.
         */
-        acc = acc + (double)pooled[(size_t)b * idx_dim + d] *
-                        (double)q_idx[(size_t)wid * idx_dim + d];
+        acc = acc + (float)pooled[(size_t)b * idx_dim + d] *
+                        (float)q_idx[(size_t)wid * idx_dim + d];
     /*
 DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
 masked sub_group function which may not be supported by all compilers or
@@ -386,11 +386,11 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
     if (item_ct1.get_local_id(2) != 0) return;
-    double score = 0.0;
+    float score = 0.0;
 #pragma unroll
     for (int h = 0; h < idx_n_head; ++h) score +=
         (s_dot[h] > 0.0) ? s_dot[h] : 0.0;
-    if (bias != nullptr) score += (double) bias[b];
+    if (bias != nullptr) score += (float) bias[b];
     // cell_block: cells of block b for b < n_bid, and the WHOLE incomplete tail for b == n_bid
     long long lo = b * r, hi = lo + r;
     if (b == n_bid) hi = n_kv;
@@ -678,7 +678,7 @@ __dpct_inline__ void qsa_attend_kernel(
     */
     item_ct1.barrier();
 
-    float mx = -FLT_MAX;    // not -inf, whose double -> float conversion nvcc warns about
+    float mx = -FLT_MAX;    // not -inf, whose float -> float conversion nvcc warns about
 #pragma unroll
     for (long long j = d; j < n_ids; j += item_ct1.get_local_range(2))
         mx = sycl::fmax(mx, w[j]);
@@ -766,9 +766,9 @@ __dpct_inline__ void qsa_gate_apply_kernel(const float *__restrict__ attn,
         item_ct1.get_local_id(2);
     if (i >= (long long) n_head * head_dim) return;
     const int h = (int) (i / head_dim), d = (int) (i % head_dim);
-    const double g = (double) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
-    const double sig = 1.0 / (1.0 + sycl::exp(-g));
-    out[i] = f16_from_f32((float) ((double) attn[i] * sig));
+    const float g = (float) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
+    const float sig = 1.0 / (1.0 + sycl::exp(-g));
+    out[i] = f16_from_f32((float) ((float) attn[i] * sig));
 }
 
 inline unsigned grid_for(long long n, int threads) {
@@ -910,10 +910,6 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, 
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class qsa_index_kernel_bb65cd>>(
                 sycl::nd_range<3>(sycl::range(1, 1, (unsigned)max_blocks) *
@@ -1114,7 +1110,7 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     from the original code. Check that the allocated memory size in the migrated
     code is correct.
     */
-    const size_t smem = (size_t)s.idx_dim * sizeof(double);
+    const size_t smem = (size_t)s.idx_dim * sizeof(float);
     // **ONE LAUNCH, NO HOST BRANCH ON THE POSITION.**  The completion rotation is inside the kernel now.  The
     // arguments here are identical for every token, which is the property a CUDA graph needs: this function can
     // be captured and replayed, and the position arrives through `pos_dev` like every other kernel's data.
@@ -1126,10 +1122,6 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
         strata::q_of(stream)
             ->submit([&](sycl::handler &cgh) {
                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
@@ -1219,9 +1211,9 @@ __dpct_inline__ void qsa_gate_apply_f32_kernel(const float *__restrict__ attn,
         item_ct1.get_local_id(2);
     if (i >= (long long) n_head * head_dim) return;
     const int h = (int) (i / head_dim), d = (int) (i % head_dim);
-    const double g = (double) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
-    const double sig = 1.0 / (1.0 + sycl::exp(-g));
-    out[i] = (float) ((double) attn[i] * sig);
+    const float g = (float) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
+    const float sig = 1.0 / (1.0 + sycl::exp(-g));
+    out[i] = (float) ((float) attn[i] * sig);
 }
 
 void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes& s, float* out, void* stream) {
@@ -1230,10 +1222,6 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
         strata::q_of(stream)
             ->parallel_for<
                 dpct_kernel_name<class qsa_gate_apply_f32_kernel_7cff4f>>(
@@ -1255,10 +1243,6 @@ void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, 
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
         strata::q_of(stream)
             ->parallel_for<
                 dpct_kernel_name<class qsa_gate_apply_kernel_650dec>>(

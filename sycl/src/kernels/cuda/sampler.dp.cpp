@@ -39,9 +39,8 @@
 namespace {
 // The sampler's accumulators are strata::samp_acc_t (float unless -DSTRATA_SYCL_SAMPLER_FP64=1), so its kernels need FP64
 // only in that build. dpct left an `aspect::fp64` check before every launch; on an Arc Alchemist (A750, no FP64) it
-// threw "'double' is not supported" at the first sampled token unless Intel's FP64 emulation was switched on.
+// threw "'float' is not supported" at the first sampled token unless Intel's FP64 emulation was switched on.
 inline void sampler_require_fp64([[maybe_unused]] const sycl::device& d) {
-    if constexpr (std::is_same_v<strata::samp_acc_t, double>) dpct::has_capability_or_fail(d, {sycl::aspect::fp64});
 }
 }  // namespace
 
@@ -415,12 +414,12 @@ auto &sv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
 ///
 /// THE SEMANTICS ARE THE SERIAL ONES, EXACTLY.  Each round's argmax resolves ties to the LOWEST index (the
 /// serial scan's strict `>` keeps the first maximum it meets), so the kept sequence - both its set and its
-/// order - is unchanged; `top_p`'s cut reads that order in double arithmetic as before; temperature and the
+/// order - is unchanged; `top_p`'s cut reads that order in float arithmetic as before; temperature and the
 /// Philox draw apply after the cut.  `sampler_parity` pins all of it against the host reference.
 ///
 /// **KEPT AS THE REFERENCE, BEHIND `STRATA_OLD_SAMPLER=1`.**  Two costs remain in it: the `taken`
 /// sweep is O(k) per logit per round, O(k^2 x n_vocab) per row (47 M shared-memory compares at k = 20, 500 M at
-/// 64), and the double-precision tail runs on all 1,024 threads where one warp suffices - GeForce issues FP64 at
+/// 64), and the float-precision tail runs on all 1,024 threads where one warp suffices - GeForce issues FP64 at
 /// 1/64 of FP32.  The kernels after this one remove both and select the same list in the same order.
 /*
 DPCT1110: The total declared local variable size in device function
@@ -689,9 +688,9 @@ __dpct_inline__ void warp_first(float &bv, int &bi) {
 
 /// **THE TAIL ON ONE WARP, WITH `sampler_kernel`'S ARITHMETIC.**  `sel_ids` / `sel_logit` (shared, `k` entries) are
 /// the top_k list in selection order; the 32 lanes of one warp call this and lane 0 writes `out[t]`.  The old tail
-/// ran on all 1,024 threads, each computing the same ~4k double `exp`s - FP64 issues at 1/64 of FP32 on GeForce.
+/// ran on all 1,024 threads, each computing the same ~4k float `exp`s - FP64 issues at 1/64 of FP32 on GeForce.
 /// Here the lanes share the `exp`s (one per entry, into `ex`) and then the quotients, and lane 0 alone runs the two
-/// ORDERED sums and the two cumulative scans.  Every double is the one the old chain computed: the same `exp` of
+/// ORDERED sums and the two cumulative scans.  Every float is the one the old chain computed: the same `exp` of
 /// the same argument, the sums in the same order, `cum += e / sum` with the same correctly rounded quotient - so
 /// the cut, the survivors and the pick are the same.  (`n_keep == 0`, reachable only with min_p > 1, which the
 /// callers clamp, read `sel_ids[-1]` in the old tail; it reads `sel_ids[0]` here.)
