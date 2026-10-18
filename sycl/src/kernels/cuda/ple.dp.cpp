@@ -5,9 +5,9 @@
 // The legacy arithmetic below follows the captured CPU ggml graph
 // (`bench/micro/ple_in.bin` / `ple_out.bin`, produced by `ple_layer_xcheck.cpp`):
 //
-//   * `rms_norm` accumulates `(double)(x*x)` with the PRODUCT rounded in f32 first - that is literally what
+//   * `rms_norm` accumulates `(float)(x*x)` with the PRODUCT rounded in f32 first - that is literally what
 //     `ggml_compute_forward_rms_norm_f32` does (`sum += (ggml_float)(x[i00]*x[i00])` with `ggml_float` =
-//     double), and it is not the same as accumulating in f32 or as widening before the multiply.
+//     float), and it is not the same as accumulating in f32 or as widening before the multiply.
 //   * `silu` is `x / (1 + expf(-x))` in f32, which is `ggml_silu_f32`.
 //   * the gate's `sqrt` and `sigmoid` are f32.
 //
@@ -76,11 +76,11 @@ __dpct_inline__ float silu_f(float x) {
     return x / (1.0f + sycl::native::exp(-x));
 }
 
-/// Block-wide sum in double, broadcast to all threads.  The leading `__syncthreads` matters: the result is
+/// Block-wide sum in float, broadcast to all threads.  The leading `__syncthreads` matters: the result is
 /// read out of `scratch[0]` and a later call reuses the array, so without a barrier a fast thread can
 /// overwrite it before a slow one has read it - invisible in most runs and a slightly different norm when it
 /// fires.
-inline double block_sum(double v, double *scratch) {
+inline float block_sum(float v, float *scratch) {
     /*
     DPCT1065: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
@@ -147,21 +147,21 @@ __dpct_inline__ void gnorm_kernel(const float *__restrict__ x,
                                   float *__restrict__ y, int n_embd,
                                   float eps) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
+auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[8]>(
     sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const int c = item_ct1.get_group(2);
     const float* xc = x + (size_t) c * n_embd;
     const float* wc = w + (size_t) c * n_embd;
     float* yc = y + (size_t) c * n_embd;
 
-    double acc = 0.0;
+    float acc = 0.0;
     for (int d = item_ct1.get_local_id(2); d < n_embd;
          d += item_ct1.get_local_range(2)) {
         // The PRODUCT is rounded in f32 before it is widened - `(ggml_float)(x[i00]*x[i00])`.
         const float sq = xc[d] * xc[d];
-        acc += (double) sq;
+        acc += (float) sq;
     }
-    const float mean = (float) (block_sum(acc, scratch) / (double) n_embd);
+    const float mean = (float) (block_sum(acc, scratch) / (float) n_embd);
     const float scale = 1.0f / sycl::sqrt(mean + eps);
 #pragma unroll
     for (int d = item_ct1.get_local_id(2); d < n_embd;
@@ -177,16 +177,16 @@ __dpct_inline__ void gate_kernel(const float *__restrict__ key,
                                  float *__restrict__ gate, int n_embd,
                                  float inv_sqrt_n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
+auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[8]>(
     sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const int c = item_ct1.get_group(2);
     const float* kc = key + (size_t) c * n_embd;
     const float* qc = query + (size_t) c * n_embd;
-    double acc = 0.0;
+    float acc = 0.0;
 #pragma unroll
     for (int d = item_ct1.get_local_id(2); d < n_embd;
-         d += item_ct1.get_local_range(2)) acc += (double)(kc[d] * qc[d]);
-    const float s = (float) (block_sum(acc, scratch) / (double) 1.0) * inv_sqrt_n;
+         d += item_ct1.get_local_range(2)) acc += (float)(kc[d] * qc[d]);
+    const float s = (float) (block_sum(acc, scratch) / (float) 1.0) * inv_sqrt_n;
     const float mag = sycl::sqrt(sycl::fmax(sycl::fabs(s), 1e-6f));
     const float sgn = (s > 0.0f) ? 1.0f : ((s < 0.0f) ? -1.0f : 0.0f);
     if (item_ct1.get_local_id(2) == 0) gate[c] =
@@ -260,10 +260,10 @@ __dpct_inline__ void bf16_gemv_kernel(const uint16_t *__restrict__ x,
                   item_ct1.get_local_id(2);
     if (o >= n_out) return;
     const uint16_t* row = w + (size_t) o * n_in;
-    double acc = 0.0;
+    float acc = 0.0;
 #pragma unroll
     for (int i = 0; i < n_in; ++i) acc +=
-        (double)bf16_float(x[i]) * (double)bf16_float(row[i]);
+        (float)bf16_float(x[i]) * (float)bf16_float(row[i]);
     y[o] = (float) acc;
 }
 
@@ -434,9 +434,6 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp64});
-
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 
@@ -455,9 +452,6 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp64});
-
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 
@@ -503,9 +497,6 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp64});
-
             st->parallel_for<dpct_kernel_name<class bf16_gemv_kernel_47d04d>>(
                 sycl::nd_range<3>(
                     sycl::range(1, 1, (n_embd + THREADS - 1) / THREADS) *
@@ -529,9 +520,6 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp64});
-
             st->submit([&](sycl::handler &cgh) {
                 auto sqrtf_float_n_embd_ct4 = 1.0f / sqrtf((float)n_embd);
 
@@ -563,9 +551,6 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp64});
-
             st->submit([&](sycl::handler &cgh) {
                 auto NG_RMS_EPS_ct4 = NG_RMS_EPS;
 

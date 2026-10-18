@@ -121,7 +121,7 @@ __dpct_inline__ void silu_kernel(float *__restrict__ x, int64_t n) {
     // DOUBLE then cast, matching `ref/gdn.py`'s numpy: its arrays are f32 but `np.exp` on an f32 array is
     // computed to f32 precision by a different algorithm than `expf`, and the reference is the oracle.  The
     // difference is in the last bits and this is one line.
-    const double v = (double) x[i];
+    const float v = (float) x[i];
     x[i] = (float)(v / (1.0 + sycl::exp(-v)));
 }
 
@@ -329,10 +329,6 @@ void silu_inplace(float* x, int64_t n, void* stream) {
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class silu_kernel_4d1386>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid_for(n)) *

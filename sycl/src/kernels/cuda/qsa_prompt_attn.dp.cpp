@@ -680,7 +680,7 @@ prompt_attn_kernel(const float *__restrict__ q, QsaAttnPools p,
 
 // ---- v2 (int8 KV): warp w owns dims [64w, 64w+64) for both q.k and p.v, which is also int8 scale group w. So a
 // warp needs only its own 64-byte slice of each K and V row: it gathers it itself with cp.async into its own
-// double-buffered stage while it computes the previous chunk, and q stays in registers. Only the q.k partial sums
+// float-buffered stage while it computes the previous chunk, and q stays in registers. Only the q.k partial sums
 // (one per dim group) cross warps, and they are added in a fixed order: the result is deterministic.
 constexpr int CH2 = 32;
 

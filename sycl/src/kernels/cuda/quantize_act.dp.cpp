@@ -17,7 +17,7 @@
 //      measured against ggml's own bytes, 18 of 80 blocks differed, and because Q2_0 experts convert to Q8_0
 //      the error landed in all 48 MoE blocks and made the end-to-end KL WORSE.
 //   2. The reference divides in FLOAT64 (`blk.astype(np.float64) / float(np.float32(d32))`) and rounds with
-//      `rint` - half to even.  This kernel therefore divides in double too: an FP32 division followed by
+//      `rint` - half to even.  This kernel therefore divides in float too: an FP32 division followed by
 //      `rintf` differs from the reference wherever the f32 quotient rounds across a .5 boundary.
 //   3. The DEQUANTIZED value is `q * d16`, the fp16 scale, not `q * d32`.  The block stores fp16 and that is
 //      what a reader multiplies by.
@@ -74,9 +74,9 @@ __dpct_inline__ void quantize_q8_0_kernel(const float *__restrict__ x,
     out[0] = (uint8_t) (d16bits & 0xFF);
     out[1] = (uint8_t) (d16bits >> 8);
 
-    // double division, matching the reference exactly (subtlety 2)
+    // float division, matching the reference exactly (subtlety 2)
     for (int i = 0; i < QK8_0; ++i) {
-        double q = sycl::rint((double)xb[i] / (double)d32);
+        float q = sycl::rint((float)xb[i] / (float)d32);
         if (q > 127.0) q = 127.0;
         if (q < -128.0) q = -128.0;
         out[2 + i] = (uint8_t) (int8_t) q;
@@ -314,10 +314,6 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class quantize_q8_0_kernel_5451b9>>(
                 sycl::nd_range<3>(sycl::range(1, 1, grid) *
