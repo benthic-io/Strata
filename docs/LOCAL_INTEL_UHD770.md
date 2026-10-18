@@ -109,3 +109,21 @@ Remaining failures:
   resolve kernel needs a 512-thread rewrite that preserves the 1024-slot clock sweep.
 - `ple_parity`: skipped (needs the Q2_0 shard 2 GGUF).
 - `s2_expert_grouped_parity`: 4 numerical failures.
+
+## Running Cyber-Tiel (CUDA/HIP only)
+
+This machine has no CUDA/HIP GPU, so the model cannot be executed here. On a supported
+NVIDIA/AMD card the same own-path flow as Qwen3.6-35B-A3B applies:
+
+```sh
+# example only; adjust paths and quant
+./setup.sh --family qwen36 ...   # see OWN_PATH_FAMILIES in setup.py
+```
+
+Cyber-Tiel file used for this note:
+- `Cyber-Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf`
+- `mmproj-BF16.gguf`
+- local path: `/home/otherdrums/models/cyber-tiel/`
+
+The Intel iGPU path above is experimental and currently passes most kernel parity
+tests, but not yet the full engine. The remaining failures are documented above.
