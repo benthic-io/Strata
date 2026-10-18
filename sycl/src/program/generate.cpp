@@ -25,6 +25,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/sycl_unified.hpp"
 #include "strata/sycl_doorbell.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -4433,6 +4434,24 @@ int main(int argc, char **argv) try {
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head) -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
+        // SYCL port: the cache is ONE device allocation, and Level Zero caps that at 4 GiB on the consumer parts (an
+        // Arc A750, an integrated UHD 770) even though the card has far more memory free - so a cache sized purely
+        // from "free" asks for an allocation the driver refuses. Size it under the cap and say so; the CPU computes
+        // whatever does not fit, which is the i915 path's shape anyway.
+        {
+            const size_t cap = strata::sycl_detail::max_single_alloc_bytes(dpct::get_current_device());
+            if (cap > 0 && o.expert_cache > 0) {
+                const int64_t cap_slots = (int64_t) (cap / (size_t) blob);
+                if ((int64_t) o.expert_cache > cap_slots) {
+                    std::fprintf(stderr, "strata generate: expert cache auto: this driver caps one allocation at "
+                                         "%.2f GiB (the card has %.2f GiB free), so the cache holds %lld slots and not "
+                                         "%d; the CPU computes the experts that do not fit\n",
+                                 (double) cap / 1073741824.0, (double) free_b / 1073741824.0, (long long) cap_slots,
+                                 o.expert_cache);
+                    o.expert_cache = (int) std::max<int64_t>(cap_slots, 0);
+                }
+            }
+        }
         // #496: the verify window cannot start without a cache (#174), and a cache too small to lend the prompt path
         // a 256-token chunk's buffers (plus the 128 slots a loan leaves; one slot without --prefill) makes it
         // allocate its own on top - more than the reserve.  When the default reserve leaves less than that (a 6 GB
