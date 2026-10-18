@@ -34,7 +34,7 @@ static_assert(sizeof(QB) == 36, "q8_1 block");
 __dpct_inline__ float wsum(float x) {
 #pragma unroll
     /*
-    DPCT1108:3: '__shfl_xor_sync' was migrated with the experimental feature
+    DPCT1108:9: '__shfl_xor_sync' was migrated with the experimental feature
     masked sub_group function which may not be supported by all compilers or
     runtimes. You may need to adjust the code.
     */
@@ -47,7 +47,7 @@ __dpct_inline__ float wsum(float x) {
 __dpct_inline__ float wmax(float x) {
 #pragma unroll
     /*
-    DPCT1108:4: '__shfl_xor_sync' was migrated with the experimental feature
+    DPCT1108:10: '__shfl_xor_sync' was migrated with the experimental feature
     masked sub_group function which may not be supported by all compilers or
     runtimes. You may need to adjust the code.
     */
@@ -112,10 +112,10 @@ __dpct_inline__ void q8_store(QB *__restrict__ y, int i, float v, int lane) {
 /// res[c] = the row's value for column c in every lane.
 template <int NC, int NJ, bool PK>
 /*
-DPCT1110:5: The total declared local variable size in device function q8_row_dot
-exceeds 128 bytes and may cause high register pressure. Consult with your
-hardware vendor to find the total register size available and adjust the code,
-or use smaller sub-group size to avoid high register pressure.
+DPCT1110:11: The total declared local variable size in device function
+q8_row_dot exceeds 128 bytes and may cause high register pressure. Consult with
+your hardware vendor to find the total register size available and adjust the
+code, or use smaller sub-group size to avoid high register pressure.
 */
 __dpct_inline__ void q8_row_dot(const uint8_t *__restrict__ w,
                                 const sycl::half *__restrict__ dpl,
@@ -209,7 +209,7 @@ inline void launch_q8_rows_t(const void *w, const sycl::half *dpl,
                              int warps, int max_warps, dpct::queue_ptr s) {
     const int rows = n_out < max_warps ? n_out : max_warps;
     /*
-    DPCT1049:6: The work-group size passed to the SYCL kernel may exceed the
+    DPCT1049:12: The work-group size passed to the SYCL kernel may exceed the
     limit. To get the device limit, query info::device::max_work_group_size.
     Adjust the work-group size if needed.
     */
@@ -270,7 +270,7 @@ auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NC][32]>(
             u[c][warp] = ru[c];
         }
     /*
-    DPCT1065:47: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:53: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -280,7 +280,7 @@ auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NC][32]>(
         for (int c = 0; c < NC; ++c) {
             const float gi = g[c][lane];
             /*
-            DPCT1013:46: The rounding mode could not be specified and the
+            DPCT1013:52: The rounding mode could not be specified and the
             generated code may have different accuracy than the original code.
             Verify the correctness. SYCL math built-in function rounding mode is
             aligned with OpenCL C 1.2 standard.
@@ -310,7 +310,7 @@ auto &sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[256]>(
     }
     sh[item_ct1.get_local_id(2)] = s;
     /*
-    DPCT1065:48: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:54: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -320,11 +320,11 @@ auto &sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[256]>(
         if ((int)item_ct1.get_local_id(2) < o) sh[item_ct1.get_local_id(2)] +=
             sh[item_ct1.get_local_id(2) + o];
         /*
-        DPCT1118:7: SYCL group functions and algorithms must be encountered in
+        DPCT1118:13: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:49: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:55: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -333,7 +333,7 @@ auto &sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[256]>(
     const float r = sycl::rsqrt(sh[0] / (float)n + eps);
     for (int i = item_ct1.get_local_id(2); i < n; i += 256) {
         /*
-        DPCT1013:50: The rounding mode could not be specified and the generated
+        DPCT1013:56: The rounding mode could not be specified and the generated
         code may have different accuracy than the original code. Verify the
         correctness. SYCL math built-in function rounding mode is aligned with
         OpenCL C 1.2 standard.
@@ -373,14 +373,14 @@ auto &vv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2048]>(
                               : t * K_ + item_ct1.get_local_id(2)) *
                     n;
     /*
-    DPCT1065:51: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:57: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
     item_ct1.barrier();
     const float* wr = wts + (size_t) t * K_;
     const float gs = sigm(sgate[(size_t) t * sg_stride]);
-    for (int i = item_ct1.get_local_id(2); i < n; i += 1024) {
+    for (int i = item_ct1.get_local_id(2); i < n; i += item_ct1.get_local_range(2)) {
         float acc = wr[0] * pk[0][i];
 #pragma unroll
         for (int k = 1; k < K_; ++k)
@@ -392,7 +392,7 @@ auto &vv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2048]>(
     }
     if (wn == nullptr) return;
     /*
-    DPCT1065:52: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:58: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -405,7 +405,7 @@ auto &vv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2048]>(
         sh[item_ct1.get_local_id(2)] = s;
     }
     /*
-    DPCT1065:53: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:59: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -415,20 +415,20 @@ auto &vv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2048]>(
         if ((int)item_ct1.get_local_id(2) < s) sh[item_ct1.get_local_id(2)] +=
             sh[item_ct1.get_local_id(2) + s];
         /*
-        DPCT1118:8: SYCL group functions and algorithms must be encountered in
+        DPCT1118:14: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:54: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:60: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
         item_ct1.barrier();
     }
     const float r = sycl::rsqrt(sh[0] / (float)n + eps);
-    for (int i = item_ct1.get_local_id(2); i < n; i += 1024) {
+    for (int i = item_ct1.get_local_id(2); i < n; i += item_ct1.get_local_range(2)) {
         /*
-        DPCT1013:55: The rounding mode could not be specified and the generated
+        DPCT1013:61: The rounding mode could not be specified and the generated
         code may have different accuracy than the original code. Verify the
         correctness. SYCL math built-in function rounding mode is aligned with
         OpenCL C 1.2 standard.
@@ -493,7 +493,7 @@ auto &sid = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[64]>(
 /// launch, k_group_small's grouping of the picks.  block (32, 8).  HY as k_group_small.
 template <bool HY>
 /*
-DPCT1110:9: The total declared local variable size in device function
+DPCT1110:15: The total declared local variable size in device function
 k_route_group exceeds 128 bytes and may cause high register pressure. Consult
 with your hardware vendor to find the total register size available and adjust
 the code, or use smaller sub-group size to avoid high register pressure.
@@ -543,7 +543,7 @@ __dpct_inline__ void k_route_group(
 #pragma unroll
             for (int mask = 16; mask; mask >>= 1) {
                 /*
-                DPCT1108:10: '__shfl_xor_sync' was migrated with the
+                DPCT1108:16: '__shfl_xor_sync' was migrated with the
                 experimental feature masked sub_group function which may not be
                 supported by all compilers or runtimes. You may need to adjust
                 the code.
@@ -554,7 +554,7 @@ __dpct_inline__ void k_route_group(
                         sycl::ext::oneapi::this_work_item::get_sub_group(),
                         best, mask);
                 /*
-                DPCT1108:11: '__shfl_xor_sync' was migrated with the
+                DPCT1108:17: '__shfl_xor_sync' was migrated with the
                 experimental feature masked sub_group function which may not be
                 supported by all compilers or runtimes. You may need to adjust
                 the code.

@@ -774,7 +774,13 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 #else
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8)
 #endif
+// Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them.
+// SYCL port: upstream also lists X(40) (NVFP4) in every list; the port has no NVFP4 kernels, so it stays out.
+#ifdef STRATA_Q6K_EXPERTS
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14)
+#else
 #define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8)
+#endif
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8)
 
 __dpct_inline__ float warp_sum(float v) {
