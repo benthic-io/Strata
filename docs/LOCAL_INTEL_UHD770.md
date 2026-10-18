@@ -127,3 +127,43 @@ Cyber-Tiel file used for this note:
 
 The Intel iGPU path above is experimental and currently passes most kernel parity
 tests, but not yet the full engine. The remaining failures are documented above.
+
+## The qwen35moe family on an Intel GPU (Cyber-Tiel 35B)
+
+The family Strata already supports for `Qwen3.6-35B-A3B` (`OWN_PATH_FAMILIES`, `src/qwen35/`) is the
+architecture **Cyber-Tiel-Coder-35B-A3B** is built on (`qwen35moe`), and it was CUDA/HIP only: the
+SYCL build refused it outright because `src/qwen35/q36_engine.cu` is a CUDA translation unit.
+
+It is now migrated into `sycl/src/qwen35/` and **runs on this machine's UHD 770**:
+
+```sh
+cmake -S sycl -B build-sycl -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+      -DSTRATA_GGML_DIR=/home/otherdrums/llama.cpp
+cmake --build build-sycl --target strata-q36 -j 8
+IGC_EnableDPEmulation=1 ONEAPI_DEVICE_SELECTOR=level_zero:gpu ./build-sycl/strata-q36 \
+  --model /home/otherdrums/models/cyber-tiel/Cyber-Tiel-Coder-35B-A3B-MTP-UD-Q4_K_XL.gguf \
+  --no-mtp-block --max-context 2048 --chunk 256 --tokens 1,2,3 --n 8
+```
+
+measured (UHD 770, i5-13500, 62 GB, oneAPI 2026.1, Level Zero 1.17):
+
+| | |
+|---|---|
+| load | 753 tensors, 4.32 GiB of dense weights placed, every routed expert (18.33 GiB) in the shared memory, 5.4 s |
+| warm-up (one chunk + one decode) | 11.5 s |
+| prompt, 3 tokens | 269 ms (**11.2 tok/s**) |
+| decode, 8 tokens | 912 ms (**8.8 tok/s**) |
+
+**The answers are NaN.** The engine's own verifier (`STRATA_Q36_VERIFY=1`) says the same: the first
+attention output of layer 0 is already NaN, so it emits the no-token sentinel. This is "it runs",
+not "it is right" - the numerics are the next piece of work, and the suspects are in the migrated
+attention kernels (`k_attn_prep` / `k_attn_part` / `k_attn_merge`) and the K-quant expert kernels.
+
+Flags the port added on the way:
+
+- `--no-mtp-block`: run without the file's MTP draft block. Cyber-Tiel's (like Unsloth's UD-Q4_K_XL
+  for Qwen3.6) quantizes that block **Q3_K**, which no grouped-expert kernel takes, and that refused
+  the whole file for a layer that only ever produces drafts. Costs speculative decoding, nothing else.
+- `strata-q36` (the family's own entry point) as a build target, as in the CUDA build.
+
+Measured once the Q3_K kernels exist, `--no-mtp-block` should stop being necessary.
