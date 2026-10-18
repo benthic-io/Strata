@@ -256,7 +256,18 @@ target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 # what lets the family run on an Intel GPU instead of being CUDA/HIP only.
 add_library(strata_qwen35 STATIC ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_engine.dp.cpp)
 target_link_libraries(strata_qwen35 PRIVATE strata_prefill strata_kernels strata_engine)
+if(STRATA_NATIVE_EXPERTS)
+  # the hybrid mode (experts that do not all fit in VRAM): the CPU expert pool on ggml-cpu's arithmetic.  This is
+  # the normal case on an integrated GPU, where the model is far larger than any cache the driver will hand out.
+  target_link_libraries(strata_qwen35 PRIVATE strata_kernels_cpu)
+  target_compile_definitions(strata_qwen35 PRIVATE STRATA_Q36_CPU_POOL=1)
+endif()
 target_link_libraries(strata PRIVATE strata_qwen35)
+# strata-q36: the qwen35moe engine's own entry point (src/qwen35/q36_main.cpp), which runs without the server:
+# `strata-q36 --model GGUF --tokens IDS --n 64` is the reference interface tools/qwen35/kl.py drives, and
+# `--bench-pp N --bench-tg N` times it.  The CUDA build ships the same target.
+add_executable(strata-q36 ${STRATA_ROOT}/src/qwen35/q36_main.cpp)
+target_link_libraries(strata-q36 PRIVATE strata_qwen35 strata_includes)
 
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
 option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)

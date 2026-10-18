@@ -287,4 +287,18 @@ inline void* malloc_device_guarded(size_t bytes, sycl::queue& q, const char* wha
     device_alloc_register(p, bytes);
     return p;
 }
+// sycl::malloc_host for an allocation big enough that the driver may refuse it.  cudaHostAlloc answers with an
+// error code; SYCL's malloc_host may answer with a null pointer and no error, and the Level Zero driver does exactly
+// that for the tens of gigabytes a MoE's experts want (the A750 refuses a pinned host allocation above a few GB).  The
+// callers that size their own fallback (the qwen35moe engine's expert arena) must see the refusal, so this returns
+// null and lets them choose; it never throws.
+inline void* malloc_host_guarded(size_t bytes, sycl::queue& q) {
+    void* p = nullptr;
+    try {
+        p = sycl::malloc_host(bytes, q);
+    } catch (const sycl::exception&) {
+        return nullptr;
+    }
+    return p;
+}
 }  // namespace strata
