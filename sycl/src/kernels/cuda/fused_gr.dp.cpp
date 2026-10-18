@@ -10,6 +10,7 @@
 #include "strata/sycl_queue.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -2048,7 +2049,22 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     need to rewrite this code.
     */
     const dpct::err0 e = 0;
-    return false;   // SYCL port: the q8_1 images (S26 STRATA_QFUSE) and the Q8_0 reads (S23 STRATA_HC_Q8) are not built; the caller quantizes
+    // SYCL port: S26 STRATA_QFUSE.  `mixed` is the MoE input and the expert GEMMs want it as q8_1; writing that
+    // image here is what STRATA_QFUSE fuses (otherwise the caller runs native_quantize_q8_1 over the same floats a
+    // second time).  The bytes are the ones native_quantize_q8_1 writes, so the expert kernels read exactly what
+    // they would have read from the caller's own pass - gr_parity checks that byte for byte.  q8_cnt is zeroed once
+    // by the caller and every launch leaves it zero, so there is nothing to reset here.
+    bool wrote_q8 = false;
+    {
+        bool all = true;
+        for (int t = 0; t < n_tok; ++t) all = all && a[t].q8_mixed != nullptr;
+        if (all) {
+            for (int t = 0; t < n_tok; ++t)
+                native_quantize_q8_1(a[t].mixed, a[t].q8_mixed, N, 1, stream);
+            wrote_q8 = true;
+        }
+    }
+    return wrote_q8;   // the Q8_0 reads (S23 STRATA_HC_Q8) are still not built on this path
 }
 
 // the bench only (AMD latency-hidden kernels): nothing to switch on the SYCL port
