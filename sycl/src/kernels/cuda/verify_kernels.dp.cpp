@@ -1076,7 +1076,7 @@ void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_e
 }
 
 void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t* count, void* stream) {
-    if (n < 1 || n > 1024) { std::fprintf(stderr, "ident_hits: n out of range\n"); std::exit(1); }
+    if (n < 1 || n > 512) { std::fprintf(stderr, "ident_hits: n out of range\n"); std::exit(1); }
     /*
     DPCT1049: The work-group size passed to the SYCL kernel may exceed the
     limit. To get the device limit, query info::device::max_work_group_size.
@@ -1088,8 +1088,8 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class ident_hits_kernel_287489>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 1024),
-                                  sycl::range(1, 1, 1024)),
+                sycl::nd_range<3>(sycl::range(1, 1, 512),
+                                  sycl::range(1, 1, 512)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
                     ident_hits_kernel(ids, n, slot, dst, count);
                 });
@@ -1253,8 +1253,8 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class row_top_prob_kernel_6adbe2>>(
                 sycl::nd_range<3>(sycl::range(1, 1, n_rows) *
-                                      sycl::range(1, 1, 1024),
-                                  sycl::range(1, 1, 1024)),
+                                      sycl::range(1, 1, 512),
+                                  sycl::range(1, 1, 512)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(32)]] {
@@ -1440,7 +1440,7 @@ struct TopRow {
     float parts[32];
 };
 
-// grid (kTopBlocks, rows), 1024 / kTopBlocks threads: thread j of block b is row_top_prob's thread b * blockDim + j
+// grid (kTopBlocks, rows), 512 / kTopBlocks threads: thread j of block b is row_top_prob's thread b * blockDim + j
 __dpct_inline__ void row_top_prob_split_kernel(const float *__restrict__ logits,
                                                int n_vocab,
                                                const int32_t *__restrict__ ids,
@@ -1455,7 +1455,7 @@ __dpct_inline__ void row_top_prob_split_kernel(const float *__restrict__ logits,
                          item_ct1.get_local_id(2));
     float s = 0.0f;
 #pragma unroll
-    for (int i = vt; i < n_vocab; i += 1024) s += sycl::native::exp(l[i] - m);
+    for (int i = vt; i < n_vocab; i += 512) s += sycl::native::exp(l[i] - m);
     /*
 DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
 masked sub_group function which may not be supported by all compilers or
@@ -1546,8 +1546,8 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
             ->parallel_for<
                 dpct_kernel_name<class row_top_prob_split_kernel_9495b0>>(
                 sycl::nd_range<3>(sycl::range(1, (unsigned)n_rows, kTopBlocks) *
-                                      sycl::range(1, 1, 1024 / kTopBlocks),
-                                  sycl::range(1, 1, 1024 / kTopBlocks)),
+                                      sycl::range(1, 1, 512 / kTopBlocks),
+                                  sycl::range(1, 1, 512 / kTopBlocks)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(32)]] {

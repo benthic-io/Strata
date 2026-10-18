@@ -149,10 +149,10 @@ __dpct_inline__ void gdn_l2_kernel(float *__restrict__ x, int cols, float eps) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int row = item_ct1.get_group(2);
     float* p = x + (size_t) row * cols;
-    float acc = 0.0;
+    double acc = 0.0;
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < cols;
-         i += item_ct1.get_local_range(2)) acc += (float)p[i] * (float)p[i];
+         i += item_ct1.get_local_range(2)) acc += (double)p[i] * (double)p[i];
     // warp reduction
     /*
 DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
@@ -164,7 +164,7 @@ runtimes. You may need to adjust the code.
         dpct::experimental::shift_sub_group_left(
             0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
             acc, off);
-    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<float>(
+    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<double>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     if (item_ct1.get_local_id(2) == 0) ssum = acc;
     /*
@@ -173,7 +173,7 @@ runtimes. You may need to adjust the code.
     performance if there is no access to global memory.
     */
     item_ct1.barrier();
-    const float inv = (float)(1.0 / sycl::sqrt(ssum + (float)eps));
+    const float inv = (float)(1.0 / sycl::sqrt(ssum + (double)eps));
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < cols;
          i += item_ct1.get_local_range(2)) p[i] *= inv;
@@ -190,10 +190,10 @@ __dpct_inline__ void gdn_out_norm_kernel(const float *__restrict__ o,
     const float* po = o + (size_t) h * S;
     const float* pz = z + (size_t) h * S;
     float* py = y + (size_t) h * S;
-    float acc = 0.0;
+    double acc = 0.0;
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < S;
-         i += item_ct1.get_local_range(2)) acc += (float)po[i] * (float)po[i];
+         i += item_ct1.get_local_range(2)) acc += (double)po[i] * (double)po[i];
     /*
 DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
 masked sub_group function which may not be supported by all compilers or
@@ -204,11 +204,11 @@ runtimes. You may need to adjust the code.
         dpct::experimental::shift_sub_group_left(
             0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
             acc, off);
-    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<float>(
+    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<double>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     if (item_ct1.get_local_id(2) == 0) ssum = acc;
     item_ct1.barrier(sycl::access::fence_space::local_space);
-    const float inv = (float)(1.0 / sycl::sqrt(ssum / (float)S + (float)eps));
+    const float inv = (float)(1.0 / sycl::sqrt(ssum / (double)S + (double)eps));
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < S;
          i += item_ct1.get_local_range(2))

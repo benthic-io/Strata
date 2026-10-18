@@ -39,7 +39,7 @@
 namespace {
 // The sampler's accumulators are strata::samp_acc_t (float unless -DSTRATA_SYCL_SAMPLER_FP64=1), so its kernels need FP64
 // only in that build. dpct left an `aspect::fp64` check before every launch; on an Arc Alchemist (A750, no FP64) it
-// threw "'float' is not supported" at the first sampled token unless Intel's FP64 emulation was switched on.
+// threw "'double' is not supported" at the first sampled token unless Intel's FP64 emulation was switched on.
 inline void sampler_require_fp64([[maybe_unused]] const sycl::device& d) {
 }
 }  // namespace
@@ -250,7 +250,7 @@ sampler_greedy_kernel(const float *__restrict__ logits, int n_vocab,
 /// result goes to slot `rank` of CTA 0, released by the next arrive; CTAs 1.. then exit (a cluster wait counts the
 /// threads that have not exited) and CTA 0 waits, reads its own slots, and writes the token.
 constexpr int kAmCtas = 8;      // CTAs per token (the portable cluster size)
-constexpr int kAmThreads = 1024;
+constexpr int kAmThreads = 512;
 #if defined(DPCT_COMPATIBILITY_TEMP) && DPCT_COMPATIBILITY_TEMP >= 900
 #define STRATA_AM_CLUSTER 1
 #else
@@ -410,16 +410,16 @@ auto &sv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[32]>(
 /// every temperature-bearing request ~30x slower than a greedy one.  The selection is `k` argmax rounds, and
 /// an argmax over the vocabulary parallelises exactly like `sampler_greedy_kernel` (block over the vocab), so
 /// the rounds run back to back inside a block-per-token launch: the per-token cost falls to
-/// `k x n_vocab / 1024` plus `k` block reductions.
+/// `k x n_vocab / 512` plus `k` block reductions.
 ///
 /// THE SEMANTICS ARE THE SERIAL ONES, EXACTLY.  Each round's argmax resolves ties to the LOWEST index (the
 /// serial scan's strict `>` keeps the first maximum it meets), so the kept sequence - both its set and its
-/// order - is unchanged; `top_p`'s cut reads that order in float arithmetic as before; temperature and the
+/// order - is unchanged; `top_p`'s cut reads that order in double arithmetic as before; temperature and the
 /// Philox draw apply after the cut.  `sampler_parity` pins all of it against the host reference.
 ///
 /// **KEPT AS THE REFERENCE, BEHIND `STRATA_OLD_SAMPLER=1`.**  Two costs remain in it: the `taken`
 /// sweep is O(k) per logit per round, O(k^2 x n_vocab) per row (47 M shared-memory compares at k = 20, 500 M at
-/// 64), and the float-precision tail runs on all 1,024 threads where one warp suffices - GeForce issues FP64 at
+/// 64), and the double-precision tail runs on all 1,024 threads where one warp suffices - GeForce issues FP64 at
 /// 1/64 of FP32.  The kernels after this one remove both and select the same list in the same order.
 /*
 DPCT1110: The total declared local variable size in device function
@@ -688,9 +688,9 @@ __dpct_inline__ void warp_first(float &bv, int &bi) {
 
 /// **THE TAIL ON ONE WARP, WITH `sampler_kernel`'S ARITHMETIC.**  `sel_ids` / `sel_logit` (shared, `k` entries) are
 /// the top_k list in selection order; the 32 lanes of one warp call this and lane 0 writes `out[t]`.  The old tail
-/// ran on all 1,024 threads, each computing the same ~4k float `exp`s - FP64 issues at 1/64 of FP32 on GeForce.
+/// ran on all 1,024 threads, each computing the same ~4k double `exp`s - FP64 issues at 1/64 of FP32 on GeForce.
 /// Here the lanes share the `exp`s (one per entry, into `ex`) and then the quotients, and lane 0 alone runs the two
-/// ORDERED sums and the two cumulative scans.  Every float is the one the old chain computed: the same `exp` of
+/// ORDERED sums and the two cumulative scans.  Every double is the one the old chain computed: the same `exp` of
 /// the same argument, the sums in the same order, `cum += e / sum` with the same correctly rounded quotient - so
 /// the cut, the survivors and the pick are the same.  (`n_keep == 0`, reachable only with min_p > 1, which the
 /// callers clamp, read `sel_ids[-1]` in the old tail; it reads `sel_ids[0]` here.)
@@ -1493,7 +1493,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
             return !v || std::atoi(v) != 0;
         }();
         // One block per token, 1,024 threads over the vocabulary.  See `sampler_greedy_kernel`.
-        const int gthreads = 1024;
+        const int gthreads = 512;
         if (!(multi && shmem == 0 && sample_greedy_cluster(logits, n_tokens, n_vocab, out, stream)))
             /*
             DPCT1049: The work-group size passed to the SYCL kernel may
@@ -1548,8 +1548,8 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
 
                 cgh.parallel_for<dpct_kernel_name<class sampler_kernel_ebb5aa>>(
                     sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tokens) *
-                                          sycl::range(1, 1, 1024),
-                                      sycl::range(1, 1, 1024)),
+                                          sycl::range(1, 1, 512),
+                                      sycl::range(1, 1, 512)),
                     exp_props,
                     [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
                         32)]] {
@@ -1633,8 +1633,8 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                         class sampler_one_block_kernel_79fa88>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, (unsigned)n_tokens) *
-                                sycl::range(1, 1, 1024),
-                            sycl::range(1, 1, 1024)),
+                                sycl::range(1, 1, 512),
+                            sycl::range(1, 1, 512)),
                         exp_props,
                         [=](sycl::nd_item<3> item_ct1)
                             [[sycl::reqd_sub_group_size(32)]] {
@@ -1725,8 +1725,8 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
 
             cgh.parallel_for<
                 dpct_kernel_name<class coupled_penalize_kernel_6ca8a2>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 1024),
-                                  sycl::range(1, 1, 1024)),
+                sycl::nd_range<3>(sycl::range(1, 1, 512),
+                                  sycl::range(1, 1, 512)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
                     coupled_penalize_kernel(
                         logits, nv, id_to_sub, id_vocab, params, ring, cap, j,

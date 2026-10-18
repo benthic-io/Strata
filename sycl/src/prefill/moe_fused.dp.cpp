@@ -242,7 +242,7 @@ inline int block_excl_sum(int v, int *total, int *sh) {
     return r;
 }
 
-// one block, a thread per expert (E <= 1024)
+// one block, a thread per expert (E <= 512)
 __dpct_inline__ void scan_kernel(Tables tb, int E) {
     auto &sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[32]>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
@@ -996,8 +996,8 @@ void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* st
 
 void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, int32_t* slot, int32_t* src,
            void* stream) {
-    if (n_expert < 1 || n_expert > 1024) {
-        std::fprintf(stderr, "prefill fused experts: %d experts (the grouping takes 1 to 1024)\n", n_expert);
+    if (n_expert < 1 || n_expert > 512) {
+        std::fprintf(stderr, "prefill fused experts: %d experts (the grouping takes 1 to 512)\n", n_expert);
         std::exit(1);
     }
     const dpct::queue_ptr s = strata::q_of(stream);
@@ -1005,7 +1005,7 @@ void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, in
     ck(DPCT_CHECK_ERROR(s->memset(tb.cnt, 0, (size_t)n_expert * 4)),
        "group memset");
     if (n > 0) {
-        const unsigned nb = std::min<unsigned>(blocks(n, 1024), 4u * (unsigned) std::max(dev_info().sms, 1));
+        const unsigned nb = std::min<unsigned>(blocks(n, 512), 4u * (unsigned) std::max(dev_info().sms, 1));
         /*
         DPCT1049: The work-group size passed to the SYCL kernel may exceed
         the limit. To get the device limit, query
@@ -1022,8 +1022,8 @@ void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, in
                     cgh.parallel_for<
                         dpct_kernel_name<class count_kernel_9919e0>>(
                         sycl::nd_range<3>(sycl::range(1, 1, nb) *
-                                              sycl::range(1, 1, 1024),
-                                          sycl::range(1, 1, 1024)),
+                                              sycl::range(1, 1, 512),
+                                          sycl::range(1, 1, 512)),
                         exp_props, [=](sycl::nd_item<3> item_ct1) {
                             count_kernel(ids, n, n_expert, tb.cnt,
                                          dpct_local_acc_ct1

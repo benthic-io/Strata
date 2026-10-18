@@ -121,7 +121,7 @@ __dpct_inline__ void silu_kernel(float *__restrict__ x, int64_t n) {
     // DOUBLE then cast, matching `ref/gdn.py`'s numpy: its arrays are f32 but `np.exp` on an f32 array is
     // computed to f32 precision by a different algorithm than `expf`, and the reference is the oracle.  The
     // difference is in the last bits and this is one line.
-    const float v = (float) x[i];
+    const double v = (double) x[i];
     x[i] = (float)(v / (1.0 + sycl::exp(-v)));
 }
 
@@ -731,7 +731,7 @@ __dpct_inline__ void doorbell_publish_value_kernel(
 void doorbell_publish_value(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k,
                             float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq, uint32_t value,
                             void* stream) {
-    if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
+    if (k > 512) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
     const bool plain = strata::doorbell_plain_payload() || g_plain_payload.load(std::memory_order_relaxed);
     const bool pair = strata::a770_fast();
     /*
@@ -746,8 +746,8 @@ void doorbell_publish_value(const float* x, const int32_t* ids, const float* wei
         strata::q_of(stream)
             ->parallel_for<
                 dpct_kernel_name<class doorbell_publish_value_kernel_9bdb22>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 1024),
-                                  sycl::range(1, 1, 1024)),
+                sycl::nd_range<3>(sycl::range(1, 1, 512),
+                                  sycl::range(1, 1, 512)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
                     doorbell_publish_value_kernel(x, ids, weights, (int)n,
                                                   (int)k, x_out, ids_out,
@@ -758,7 +758,7 @@ void doorbell_publish_value(const float* x, const int32_t* ids, const float* wei
 
 void doorbell_publish(const float* x, const int32_t* ids, const float* weights, int64_t n, int64_t k, float* x_out,
                       int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream) {
-    if (k > 1024) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
+    if (k > 512) { std::fprintf(stderr, "doorbell_publish: k too large\n"); std::exit(1); }
     const bool plain = strata::doorbell_plain_payload() || g_plain_payload.load(std::memory_order_relaxed);
     const bool pair = strata::a770_fast();
     /*
@@ -773,8 +773,8 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
         strata::q_of(stream)
             ->parallel_for<
                 dpct_kernel_name<class doorbell_publish_kernel_8b5bad>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 1024),
-                                  sycl::range(1, 1, 1024)),
+                sycl::nd_range<3>(sycl::range(1, 1, 512),
+                                  sycl::range(1, 1, 512)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
                     doorbell_publish_kernel(x, ids, weights, (int)n, (int)k,
                                             x_out, ids_out, weights_out, d_seq, plain, pair);
@@ -785,7 +785,7 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
                           float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream) {
-    if (k > 1024) { std::fprintf(stderr, "doorbell_publish_res: k too large\n"); std::exit(1); }
+    if (k > 512) { std::fprintf(stderr, "doorbell_publish_res: k too large\n"); std::exit(1); }
     static const bool full = [] { const char* v = std::getenv("STRATA_DOORBELL_CHECK"); return v != nullptr && v[0] == '1'; }();
     const bool fl = full;
     const bool plain = strata::doorbell_plain_payload() || g_plain_payload.load(std::memory_order_relaxed);
@@ -802,8 +802,8 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
         strata::q_of(stream)
             ->parallel_for<
                 dpct_kernel_name<class doorbell_publish_res_kernel_85b9b3>>(
-                sycl::nd_range<3>(sycl::range(1, 1, 1024),
-                                  sycl::range(1, 1, 1024)),
+                sycl::nd_range<3>(sycl::range(1, 1, 512),
+                                  sycl::range(1, 1, 512)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
                     doorbell_publish_res_kernel(x, ids, d_res, n_expert, (int)n,
                                                 (int)k, x_out, ids_out, d_seq, fl, plain, pair);

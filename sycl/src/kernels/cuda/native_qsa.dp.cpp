@@ -176,7 +176,7 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
     if (!std::isfinite(epsilon) || epsilon < 0.0f)
         throw std::invalid_argument("native QSA requires finite nonnegative epsilon");
     buffers(input, count * 4, gamma, std::size_t(n_cols) * 4, output, stream);
-    if (n_cols < 1024)
+    if (n_cols < 512)
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
@@ -204,14 +204,14 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<
-                dpct_kernel_name<class norm_127936, dpct_kernel_scalar<1024>>>(
+                dpct_kernel_name<class norm_127936, dpct_kernel_scalar<512>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_rows)) *
-                                      sycl::range(1, 1, 1024),
-                                  sycl::range(1, 1, 1024)),
+                                      sycl::range(1, 1, 512),
+                                  sycl::range(1, 1, 512)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(32)]] {
-                        norm<1024>(input, gamma, output, n_cols, epsilon);
+                        norm<512>(input, gamma, output, n_cols, epsilon);
                     });
     }
     check_launch();
@@ -223,7 +223,7 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* 
     if (!std::isfinite(epsilon) || epsilon < 0.0f)
         throw std::invalid_argument("native QSA requires finite nonnegative epsilon");
     buffers(input, count * 4, gamma, std::size_t(n_cols) * groups * 4, output, stream);
-    if (n_cols < 1024)
+    if (n_cols < 512)
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
@@ -252,14 +252,14 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* 
 
         ((sycl::queue *)(strata::q_of(stream)))
             ->parallel_for<dpct_kernel_name<class norm_grouped_927e80,
-                                            dpct_kernel_scalar<1024>>>(
+                                            dpct_kernel_scalar<512>>>(
                 sycl::nd_range<3>(sycl::range(1, 1, unsigned(n_rows)) *
-                                      sycl::range(1, 1, 1024),
-                                  sycl::range(1, 1, 1024)),
+                                      sycl::range(1, 1, 512),
+                                  sycl::range(1, 1, 512)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(32)]] {
-                        norm_grouped<1024>(input, gamma, output, n_cols, groups,
+                        norm_grouped<512>(input, gamma, output, n_cols, groups,
                                            epsilon);
                     });
     }

@@ -19,7 +19,7 @@
 // WHY THIS IS NO LONGER "NAIVE BY DESIGN", AND WHAT THE OLD REASONING GOT WRONG.
 //
 // The first version was ONE THREAD PER TOKEN: k passes over the experts, each pass recomputing
-// `exp((float) l[e] - mx)` for every expert.  Its comment justified that with
+// `exp((double) l[e] - mx)` for every expert.  Its comment justified that with
 //
 //     "5,120 operations per token against 2.36e9 weights of expert matvec - three orders of magnitude smaller
 //      than the thing it feeds, so the simplest correct version is also fast enough"
@@ -39,7 +39,7 @@
 //     serial scan it replaces;
 //   * the 512 EXPONENTIALS are computed ONCE each, in parallel.  The old kernel computed them ELEVEN TIMES
 //     (once for the softmax, then again inside every one of the k passes).  This is where the 3.4 ms was;
-//   * the DOUBLE SUM is still accumulated on ONE thread in ASCENDING order.  512 float adds is about a
+//   * the DOUBLE SUM is still accumulated on ONE thread in ASCENDING order.  512 double adds is about a
 //     microsecond and it keeps the accumulation order - and therefore the last bits - identical to the
 //     reference-faithful serial version.  Parallelising it would be a free speedup and a silent change to the
 //     values, and the exp was the cost, not this;
@@ -76,9 +76,9 @@ void launch_sycl_fast(sycl::queue& q, const float* logits, int n_tokens, int n_e
                       int* ids, float* weights) {
     const int threads = (std::min(n_expert, RT_MAX_THREADS) + 31) & ~31;
     q.submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> s_ex(sycl::range<1>(n_expert), h);
+        sycl::local_accessor<double, 1> s_ex(sycl::range<1>(n_expert), h);
         sycl::local_accessor<float, 1> s_red(sycl::range<1>(RT_MAX_THREADS / 32), h);
-        sycl::local_accessor<float, 1> s_dred(sycl::range<1>(RT_MAX_THREADS / 32), h);
+        sycl::local_accessor<double, 1> s_dred(sycl::range<1>(RT_MAX_THREADS / 32), h);
         sycl::local_accessor<float, 1> s_inv(sycl::range<1>(1), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * threads),
                                         sycl::range<1>(threads)),
@@ -103,9 +103,9 @@ void launch_sycl_fast(sycl::queue& q, const float* logits, int n_tokens, int n_e
                 }
                 bar();
                 mx = s_red[0];
-                float part = 0.0;
+                double part = 0.0;
                 for (int e = tid; e < n_expert; e += nt) {
-                    const float x = sycl::exp((float)l[e] - (float)mx);
+                    const double x = sycl::exp((double)l[e] - (double)mx);
                     s_ex[e] = x;
                     part += x;
                 }
@@ -113,16 +113,16 @@ void launch_sycl_fast(sycl::queue& q, const float* logits, int n_tokens, int n_e
                     part += sycl::permute_group_by_xor(sg, part, off);
                 if (lane == 0) s_dred[warp] = part;
                 bar();
-                float tot = 0.0;
+                double tot = 0.0;
                 for (int w = 0; w < nw; ++w) tot += s_dred[w];
-                const float lo = tot * (1.0 - 0x1p-40), hi = tot * (1.0 + 0x1p-40);
+                const double lo = tot * (1.0 - 0x1p-40), hi = tot * (1.0 + 0x1p-40);
                 const float f_lo = (float)(1.0 / hi), f_hi = (float)(1.0 / lo);
                 float inv;
                 if (!FORCE_SERIAL && tot >= 1.0 && hi < 1e300 && f_lo == f_hi) {
                     inv = f_lo;
                 } else {
                     if (tid == 0) {
-                        float sum = 0.0;
+                        double sum = 0.0;
                         for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
                         s_inv[0] = (float)(1.0 / sum);
                     }
@@ -156,22 +156,22 @@ void launch_sycl_fast(sycl::queue& q, const float* logits, int n_tokens, int n_e
                     nsel = i + 1;
                 }
                 if (nsel == k) {
-                    float s = 0.0;
-                    for (int i = 0; i < k; ++i) s += (float)sycl::select_from_group(sg, my_w, i);
-                    const float sc = sycl::fmax(s, 6.103515625e-05f);
+                    double s = 0.0;
+                    for (int i = 0; i < k; ++i) s += (double)sycl::select_from_group(sg, my_w, i);
+                    const double sc = sycl::fmax(s, 6.103515625e-05);
                     if (lane < k) {
                         ids[(size_t)t * k + lane] = my_id;
-                        weights[(size_t)t * k + lane] = (float)((float)my_w / sc);
+                        weights[(size_t)t * k + lane] = (float)((double)my_w / sc);
                     }
                 } else {
                     if (lane < nsel) { ids[(size_t)t * k + lane] = my_id; weights[(size_t)t * k + lane] = my_w; }
                     sycl::group_barrier(sg);
                     if (lane == 0) {
-                        float s = 0.0;
-                        for (int i = 0; i < k; ++i) s += (float)weights[(size_t)t * k + i];
-                        const float sc = sycl::fmax(s, 6.103515625e-05f);
+                        double s = 0.0;
+                        for (int i = 0; i < k; ++i) s += (double)weights[(size_t)t * k + i];
+                        const double sc = sycl::fmax(s, 6.103515625e-05);
                         for (int i = 0; i < k; ++i)
-                            weights[(size_t)t * k + i] = (float)((float)weights[(size_t)t * k + i] / sc);
+                            weights[(size_t)t * k + i] = (float)((double)weights[(size_t)t * k + i] / sc);
                     }
                 }
             });
@@ -197,14 +197,14 @@ __dpct_inline__ void router_top10_kernel(const float *__restrict__ logits,
     auto s_raw = (unsigned char *)dpct_local;
     const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
     unsigned char* s_taken = s_raw;
-    float* s_ex = (float*) (s_raw + taken_bytes);
+    double* s_ex = (double*) (s_raw + taken_bytes);
     auto &s_red = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         float[RT_MAX_THREADS / 32]>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     auto &s_rid = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         int[RT_MAX_THREADS / 32]>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
-    auto &s_sum = *sycl::ext::oneapi::group_local_memory_for_overwrite<float>(
+    auto &s_sum = *sycl::ext::oneapi::group_local_memory_for_overwrite<double>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
 
     const int t = item_ct1.get_group(2);
@@ -258,11 +258,11 @@ runtimes. You may need to adjust the code.
     item_ct1.barrier();
     mx = s_red[0];
 
-    // ---- THE 512 EXPONENTIALS, ONCE EACH AND IN PARALLEL.  `exp` in float is software-emulated on this die
+    // ---- THE 512 EXPONENTIALS, ONCE EACH AND IN PARALLEL.  `exp` in double is software-emulated on this die
     // and was 5,632 serial calls before; it is 512 parallel ones now.
 #pragma unroll
     for (int e = tid; e < n_expert; e += nt)
-        s_ex[e] = sycl::exp((float)l[e] - (float)mx);
+        s_ex[e] = sycl::exp((double)l[e] - (double)mx);
     /*
     DPCT1065: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
@@ -272,7 +272,7 @@ runtimes. You may need to adjust the code.
 
     // ---- the sum, ascending, on one thread: see the note above on why this is NOT parallelised.
     if (tid == 0) {
-        float sum = 0.0;
+        double sum = 0.0;
 #pragma unroll
         for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
         s_sum = sum;
@@ -286,9 +286,9 @@ runtimes. You may need to adjust the code.
     const float inv = (float) (1.0 / s_sum);
 
     // ---- the selection, by rank.  `p[e] = (float)(s_ex[e] * inv)` reproduces the old expression exactly:
-    // `(float)(exp((float) l[e] - (float) mx) * inv)` with `inv` a FLOAT.
+    // `(float)(exp((double) l[e] - (double) mx) * inv)` with `inv` a FLOAT.
     // ---- p[] ONCE.  The rank loop below compares every expert against every other, so computing
-    // `(float) (s_ex[f] * inv)` INSIDE it did **512 x 512 = 262,144** float multiplies and float converts per
+    // `(float) (s_ex[f] * inv)` INSIDE it did **512 x 512 = 262,144** double multiplies and float converts per
     // token per layer instead of 512 - and a consumer die runs FP64 at a small fraction of FP32, which is why
     // this was worth more than the branch.  The shared load stays either way; the ARITHMETIC is what goes.
     //
@@ -309,7 +309,7 @@ runtimes. You may need to adjust the code.
     // **THE RANK-BY-COUNTING LOOP COMPARED EVERY EXPERT AGAINST EVERY OTHER**: 512 x 512 = 262,144 shared
     // loads and compares per token per layer, to choose ten things out of 512 - measured at 34.35 us, 63% of
     // `moe_route`'s accounted cost and the largest single item in the R3 plan.  The comment above records that
-    // the FP64 ARITHMETIC inside that loop was hoisted out once already ("262,144 float multiplies per token
+    // the FP64 ARITHMETIC inside that loop was hoisted out once already ("262,144 double multiplies per token
     // per layer instead of 512"); **the O(n^2) STRUCTURE was left, and it is the structure that costs.**
     //
     // `k` passes of a block-wide argmax is 10 x 512 = 5,120 compares - **51x less work** - and it produces the
@@ -415,13 +415,13 @@ runtimes. You may need to adjust the code.
 
     // ---- renormalise, with ggml's lower clamp.  Order preserved.
     if (tid == 0) {
-        float s = 0.0;
+        double s = 0.0;
 #pragma unroll
-        for (int i = 0; i < k; ++i) s += (float)weights[(size_t)t * k + i];
-        const float sc = sycl::fmax(s, 6.103515625e-05f); // 2**-14
+        for (int i = 0; i < k; ++i) s += (double)weights[(size_t)t * k + i];
+        const double sc = sycl::fmax(s, 6.103515625e-05); // 2**-14
 #pragma unroll
         for (int i = 0; i < k; ++i)
-            weights[(size_t) t * k + i] = (float) ((float) weights[(size_t) t * k + i] / sc);
+            weights[(size_t) t * k + i] = (float) ((double) weights[(size_t) t * k + i] / sc);
     }
 }
 
@@ -437,8 +437,8 @@ constexpr int RW_PER = 8;   // n_expert <= 64 * 8
 __global__ void __launch_bounds__(64) router_top10_wave_kernel(const float* __restrict__ logits, int n_tokens,
                                                                int n_expert, int k, int* __restrict__ ids,
                                                                float* __restrict__ weights) {
-    __shared__ float s_ex[64 * RW_PER];
-    __shared__ float s_sum;
+    __shared__ double s_ex[64 * RW_PER];
+    __shared__ double s_sum;
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
     const int lane = threadIdx.x;
@@ -456,11 +456,11 @@ __global__ void __launch_bounds__(64) router_top10_wave_kernel(const float* __re
 #pragma unroll
     for (int j = 0; j < RW_PER; ++j) {
         const int e = lane + 64 * j;
-        if (e < n_expert) s_ex[e] = exp((float) lv[j] - (float) mx);
+        if (e < n_expert) s_ex[e] = exp((double) lv[j] - (double) mx);
     }
     __syncthreads();
     if (lane == 0) {
-        float sum = 0.0;
+        double sum = 0.0;
         for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
         s_sum = sum;
     }
@@ -493,18 +493,18 @@ __global__ void __launch_bounds__(64) router_top10_wave_kernel(const float* __re
         if (lane == 0) { ids[(size_t) t * k + i] = bi; weights[(size_t) t * k + i] = bv; }
     }
     if (lane == 0) {
-        float s = 0.0;
-        for (int i = 0; i < k; ++i) s += (float) weights[(size_t) t * k + i];
-        const float sc = fmax(s, 6.103515625e-05f);       // 2**-14
+        double s = 0.0;
+        for (int i = 0; i < k; ++i) s += (double) weights[(size_t) t * k + i];
+        const double sc = fmax(s, 6.103515625e-05);       // 2**-14
         for (int i = 0; i < k; ++i)
-            weights[(size_t) t * k + i] = (float) ((float) weights[(size_t) t * k + i] / sc);
+            weights[(size_t) t * k + i] = (float) ((double) weights[(size_t) t * k + i] / sc);
     }
 }
 #endif  // STRATA_HIP_GFX906
 
 #if defined(__HIPCC__)
 // ---- S6, AMD: the same router, BIT-IDENTICAL, without its serial parts. Measured on RDNA4 (gfx1201) the kernel
-// above took 39 us per call in decode (16% of the GPU's decode time): the ascending float sum is 512 dependent FP64
+// above took 39 us per call in decode (16% of the GPU's decode time): the ascending double sum is 512 dependent FP64
 // adds (~50 cycles each there), the ten selection passes are 20 block barriers, and the renormalisation re-reads its
 // ten weights from global memory one by one.  Here:
 //   * the sum's ONLY use is inv = (float) (1.0 / sum).  Every term is positive and the largest is exactly 1
@@ -523,9 +523,9 @@ __global__ void router_top10_fast_kernel(const float* __restrict__ logits, int n
                                          int* __restrict__ ids, float* __restrict__ weights) {
     extern __shared__ unsigned char s_raw[];
     const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
-    float* s_ex = (float*) (s_raw + taken_bytes);
+    double* s_ex = (double*) (s_raw + taken_bytes);
     __shared__ float s_red[RT_MAX_THREADS / 32];
-    __shared__ float s_dred[RT_MAX_THREADS / 32];
+    __shared__ double s_dred[RT_MAX_THREADS / 32];
     __shared__ float s_inv;
     const int t = blockIdx.x;
     if (t >= n_tokens) return;
@@ -546,25 +546,25 @@ __global__ void router_top10_fast_kernel(const float* __restrict__ logits, int n
     __syncthreads();
     mx = s_red[0];
     // the exponentials (the same expression), and a tree sum of them for the bracket
-    float part = 0.0;
+    double part = 0.0;
     for (int e = tid; e < n_expert; e += nt) {
-        const float x = exp((float) l[e] - (float) mx);
+        const double x = exp((double) l[e] - (double) mx);
         s_ex[e] = x;
         part += x;
     }
     for (int off = 16; off > 0; off >>= 1) part += __shfl_xor_sync(0xffffffffu, part, off);
     if (lane == 0) s_dred[warp] = part;
     __syncthreads();
-    float tot = 0.0;
+    double tot = 0.0;
     for (int w = 0; w < nw; ++w) tot += s_dred[w];
-    const float lo = tot * (1.0 - 0x1p-40), hi = tot * (1.0 + 0x1p-40);
+    const double lo = tot * (1.0 - 0x1p-40), hi = tot * (1.0 + 0x1p-40);
     const float f_lo = (float) (1.0 / hi), f_hi = (float) (1.0 / lo);
     float inv;
     if (!FORCE_SERIAL && tot >= 1.0 && hi < 1e300 && f_lo == f_hi) {
         inv = f_lo;
     } else {   // block-uniform (every thread computed the same tot): the serial sum, exactly as router_top10_kernel
         if (tid == 0) {
-            float sum = 0.0;
+            double sum = 0.0;
             for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
             s_inv = (float) (1.0 / sum);
         }
@@ -601,22 +601,22 @@ __global__ void router_top10_fast_kernel(const float* __restrict__ logits, int n
         nsel = i + 1;
     }
     if (nsel == k) {
-        float s = 0.0;
-        for (int i = 0; i < k; ++i) s += (float) __shfl_sync(0xffffffffu, my_w, i);
-        const float sc = fmax(s, 6.103515625e-05f);       // 2**-14
+        double s = 0.0;
+        for (int i = 0; i < k; ++i) s += (double) __shfl_sync(0xffffffffu, my_w, i);
+        const double sc = fmax(s, 6.103515625e-05);       // 2**-14
         if (lane < k) {
             ids[(size_t) t * k + lane] = my_id;
-            weights[(size_t) t * k + lane] = (float) ((float) my_w / sc);
+            weights[(size_t) t * k + lane] = (float) ((double) my_w / sc);
         }
     } else {   // router_top10_kernel's tail exactly: unwritten ranks keep what the buffer held and are renormalised too
         if (lane < nsel) { ids[(size_t) t * k + lane] = my_id; weights[(size_t) t * k + lane] = my_w; }
         __threadfence();
         if (lane == 0) {
-            float s = 0.0;
-            for (int i = 0; i < k; ++i) s += (float) weights[(size_t) t * k + i];
-            const float sc = fmax(s, 6.103515625e-05f);
+            double s = 0.0;
+            for (int i = 0; i < k; ++i) s += (double) weights[(size_t) t * k + i];
+            const double sc = fmax(s, 6.103515625e-05);
             for (int i = 0; i < k; ++i)
-                weights[(size_t) t * k + i] = (float) ((float) weights[(size_t) t * k + i] / sc);
+                weights[(size_t) t * k + i] = (float) ((double) weights[(size_t) t * k + i] / sc);
         }
     }
 }
@@ -626,7 +626,7 @@ void launch_generic(const float* logits, int n_tokens, int n_expert, int k, int*
     int threads = n_expert < RT_MAX_THREADS ? n_expert : RT_MAX_THREADS;
     threads = (threads + 31) & ~31;
     const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
-    const size_t smem = taken_bytes + (size_t) n_expert * sizeof(float) + (size_t) n_expert * sizeof(float);
+    const size_t smem = taken_bytes + (size_t) n_expert * sizeof(double) + (size_t) n_expert * sizeof(float);
     if (mode == 1) {
         router_top10_fast_kernel<false><<<(unsigned) n_tokens, threads, smem, (cudaStream_t) stream>>>(
             logits, n_tokens, n_expert, k, ids, weights);
@@ -660,7 +660,7 @@ bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k
     else {
         const int threads = (std::min(n_expert, RT_MAX_THREADS) + 31) & ~31;
         const size_t taken_bytes = ((size_t)n_expert + 15u) & ~size_t(15);
-        const size_t smem = taken_bytes + n_expert * (sizeof(float) + sizeof(float));
+        const size_t smem = taken_bytes + n_expert * (sizeof(double) + sizeof(float));
         q.submit([&](sycl::handler& h) {
             sycl::local_accessor<uint8_t, 1> local(sycl::range<1>(smem), h);
             h.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (size_t)n_tokens * threads),
@@ -745,7 +745,7 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
         different from the original code. Check that the allocated memory size
         in the migrated code is correct.
         */
-        taken_bytes + (size_t)n_expert * sizeof(float) +
+        taken_bytes + (size_t)n_expert * sizeof(double) +
         (size_t)n_expert * sizeof(float);
     /*
     DPCT1049: The work-group size passed to the SYCL kernel may exceed the
