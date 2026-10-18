@@ -84,3 +84,14 @@ model cannot be executed. The same method applies to the other members of the
   it cannot be validated end to end on this hardware.
 - The SYCL port's fp64 / work-group assumptions are a portability gap worth
   raising upstream if broader Intel iGPU support is desired.
+
+## iGPU bring-up progress
+
+- Removed device-side `double` accumulations and `sycl::aspect::fp64` capability
+  gates from the SYCL kernel files (`sycl/src/kernels/cuda/*.dp.cpp`), so kernels
+  no longer require FP64 on the UHD 770.
+- gdn parity now passes; remaining failures are work-group sizes of 1024 (device
+  max 512) in doorbell/sampler/verify/qsa/native kernels, plus numerical
+  mismatches in rope/gr/shared_expert/ple.
+- Next: split 1024-wide launches into 512 (or smaller) groups and adjust grid
+  sizes and per-thread loops, then re-run parity.
