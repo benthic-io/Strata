@@ -24,7 +24,13 @@ void check(const char* what) {
     const dpct::err0 e = 0;
 }
 
-constexpr int RT = 1024;   // the resolve block
+constexpr int RT = 1024;   // slots one clock sweep examines (unchanged for every device)
+// The block is launched with the largest power-of-two sub-group multiple of 32 that both
+// divides RT and fits the device's max work-group size: 1024 on Arc, 512 on the UHD 770
+// and other consumer iGPUs, fewer on older parts.  A thread then walks RT / nt slots, so
+// the sweep visits exactly the same slots in exactly the same order as the 1024-thread
+// original - the block's resident slots and their output do not depend on its width.
+constexpr int RT_SLOT_GROUPS = 4;   // RT / nt is at most 4 (nt >= 256); the arrays below
 
 // The per-block byte runs of the (up to four) pool arrays: block b of array i is bytes [b * len, (b + 1) * len).
 struct Runs {
@@ -65,11 +71,17 @@ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const 
     return r;
 }
 
-// Block-wide exclusive prefix sum of one int per thread (RT threads); `total` is the sum over the block.
+// Block-wide exclusive prefix sum of one int per thread; `total` is the sum over the block.
+// The block may be NARROWER than 32 warps (a consumer iGPU caps the work-group at 512 = 16
+// warps, the UHD 770 among them), so the warp-of-warps pass reads only the warps that ran
+// instead of lane 31's slot.  Reading lane 31 there would read an uninitialised slot and
+// return a wrong total; the sweep only looked correct because every consumer Arc has 32
+// warps.  `warp_sums` needs max_work_group_size / 32 entries.
 inline int block_scan(int v, int *warp_sums, int &total) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int lane = item_ct1.get_local_id(2) & 31,
               w = item_ct1.get_local_id(2) >> 5;
+    const int nwarps = item_ct1.get_local_range(2) >> 5;   // the block is a multiple of a sub-group
     int x = v;
     for (int o = 1; o < 32; o <<= 1) {
         /*
@@ -90,7 +102,7 @@ inline int block_scan(int v, int *warp_sums, int &total) {
     */
     item_ct1.barrier();
     if (w == 0) {
-        int t = warp_sums[lane];
+        int t = lane < nwarps ? warp_sums[lane] : 0;
         for (int o = 1; o < 32; o <<= 1) {
             /*
             DPCT1108: '__shfl_up_sync' was migrated with the experimental
@@ -102,7 +114,7 @@ inline int block_scan(int v, int *warp_sums, int &total) {
                 t, o);
             if (lane >= o) t += y;
         }
-        warp_sums[lane] = t;
+        if (lane < nwarps) warp_sums[lane] = t;
     }
     /*
     DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -110,7 +122,7 @@ inline int block_scan(int v, int *warp_sums, int &total) {
     performance if there is no access to global memory.
     */
     item_ct1.barrier();
-    total = warp_sums[31];
+    total = warp_sums[nwarps - 1];
     const int excl = x - v + (w > 0 ? warp_sums[w - 1] : 0);
     /*
     DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -135,6 +147,8 @@ auto &s_nmiss = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
     auto &warp_sums =
         *sycl::ext::oneapi::group_local_memory_for_overwrite<int[32]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int nt = item_ct1.get_local_range(2);          // threads in this block (device-capped)
+    const int groups = RT / nt;                          // slot groups this thread walks (1..4)
     const int epoch = m.ctl[0] + 1;
     if (item_ct1.get_local_id(2) == 0) { s_nmiss = 0; s_lookups = 0; }
     /*
@@ -148,7 +162,7 @@ auto &s_nmiss = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
     for (int q = 0; q < n_q; ++q) {
         const int width = steps[q * kStepCount + kStepWidth];
         const int32_t* qi = ids + (long long) q * cap;
-        for (int i = item_ct1.get_local_id(2); i < width; i += RT) {
+        for (int i = item_ct1.get_local_id(2); i < width; i += nt) {
             const int b = qi[i] / page_size;
             if (i > 0 && qi[i - 1] / page_size == b) continue;   // ids are ascending: one lookup per block
             ++lookups;
@@ -181,12 +195,24 @@ auto &s_nmiss = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
     const int need = s_nmiss, n = (int) m.n_slots;
     int hand = m.ctl[1], got = 0;
     for (int scanned = 0; got < need && scanned < 3 * n; scanned += RT) {
-        const int j = (int)(((long long)hand + item_ct1.get_local_id(2)) % n);
-        const bool mine = m.slot_stamp[j] == epoch;
-        const bool cand = !mine && (m.slot_block[j] < 0 || m.slot_ref[j] == 0);
-        int total = 0;
-        const int rank = block_scan(cand ? 1 : 0, warp_sums, total);
+        int j[RT_SLOT_GROUPS];
+        bool mine[RT_SLOT_GROUPS], cand[RT_SLOT_GROUPS];
+        int rank[RT_SLOT_GROUPS];
         const int want = need - got;
+        int total = 0, pref = 0;
+        // Group g covers virtual slots [g*nt, g*nt+nt), so the exclusive rank of a slot is the
+        // sum of every previous group's candidates plus this thread's place inside its group.
+        // The groups are disjoint, so one prefix over the block per group is the whole scan.
+#pragma unroll
+        for (int g = 0; g < groups; ++g) {
+            j[g] = (int)(((long long)hand + g * nt + item_ct1.get_local_id(2)) % n);
+            mine[g] = m.slot_stamp[j[g]] == epoch;
+            cand[g] = !mine[g] && (m.slot_block[j[g]] < 0 || m.slot_ref[j[g]] == 0);
+            int gt = 0;
+            rank[g] = pref + block_scan(cand[g] ? 1 : 0, warp_sums, gt);
+            pref += gt;
+        }
+        total = pref;
         if (item_ct1.get_local_id(2) == 0) s_cut = RT;
         /*
         DPCT1118: SYCL group functions and algorithms must be encountered in
@@ -198,9 +224,11 @@ auto &s_nmiss = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
         better performance if there is no access to global memory.
         */
         item_ct1.barrier();
-        if (cand && rank == want - 1) s_cut =
-            item_ct1.get_local_id(2) +
-            1; // the hand stops just past the last slot taken
+        // the hand stops just past the last slot taken
+        if (cand[0] && rank[0] == want - 1) s_cut = item_ct1.get_local_id(2) + 1;
+#pragma unroll
+        for (int g = 1; g < groups; ++g)
+            if (cand[g] && rank[g] == want - 1) s_cut = g * nt + item_ct1.get_local_id(2) + 1;
         /*
         DPCT1118: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
@@ -212,11 +240,15 @@ auto &s_nmiss = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
         */
         item_ct1.barrier();
         const int cut = s_cut;
-        if (cand && rank < want) {
-            m.miss_slot[got + rank] = j;
-            m.slot_stamp[j] = epoch;   // taken: a sweep that wraps around must not take it twice
-        } else if (item_ct1.get_local_id(2) < cut && !mine) {
-            m.slot_ref[j] = 0;
+#pragma unroll
+        for (int g = 0; g < groups; ++g) {
+            const int vid = g * nt + item_ct1.get_local_id(2);
+            if (cand[g] && rank[g] < want) {
+                m.miss_slot[got + rank[g]] = j[g];
+                m.slot_stamp[j[g]] = epoch;   // taken: a sweep that wraps around must not take it twice
+            } else if (vid < cut && !mine[g]) {
+                m.slot_ref[j[g]] = 0;
+            }
         }
         got += total < want ? total : want;
         hand = (int) (((long long) hand + cut) % n);
@@ -233,7 +265,7 @@ auto &s_nmiss = *sycl::ext::oneapi::group_local_memory_for_overwrite<int>(
     }
     // 3. re-point the table; the copy kernel fills the slots
     const int placed = got < need ? got : need;
-    for (int k = item_ct1.get_local_id(2); k < need; k += RT) {
+    for (int k = item_ct1.get_local_id(2); k < need; k += nt) {
         const int b = m.miss_block[k];
         if (k >= placed) { m.page_table[b] = -1; continue; }   // overflow: never happens with a legal n_slots
         const int sl = m.miss_slot[k];
@@ -350,18 +382,22 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
                              "slot twice\n", (long long) m.n_slots, RT);
         std::exit(1);
     }
-    /*
-    DPCT1049: The work-group size passed to the SYCL kernel may exceed the
-    limit. To get the device limit, query info::device::max_work_group_size.
-    Adjust the work-group size if needed.
-    */
+    // The sweep is one work-group.  Its width is the largest power-of-two sub-group multiple of 32 that
+    // both divides RT and fits the device (Arc: 1024, a UHD 770: 512), so the same slots are visited in
+    // the same order everywhere and the resident set does not depend on the card.
+    const int cap_wg = (int) strata::q_of(stream)->get_device()
+                           .get_info<sycl::info::device::max_work_group_size>();
+    int nt = 32;
+    for (int cand_wg = RT; cand_wg >= 32; cand_wg >>= 1)
+        if (cand_wg <= cap_wg) { nt = cand_wg; break; }
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
         strata::q_of(stream)
             ->parallel_for<dpct_kernel_name<class resolve_kernel_148a81>>(
-                sycl::nd_range<3>(sycl::range(1, 1, RT), sycl::range(1, 1, RT)),
+                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)nt),
+                                  sycl::range(1, 1, (unsigned)nt)),
                 exp_props,
                 [=](sycl::nd_item<3> item_ct1)
                     [[sycl::reqd_sub_group_size(32)]] {
