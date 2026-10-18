@@ -59,10 +59,18 @@ An iGPU has no VRAM of its own, so:
 
 **What this costs.** The GPU is the small part: on a UHD 770 the engine keeps under 4 GiB of experts (the driver's cap
 on a single allocation, which `--expert-cache auto` now respects) and the CPU computes the rest, so the speed is a CPU
-number with the dense projections, the attention and the sampling offloaded to the iGPU. The 50-kernel parity suite
-passes on a UHD 770 except `gr_parity`'s fused q8_1 path (not built for the port), `iq_parity`'s Q3_K multi-column
-mmvq and `s2_expert_grouped_parity` (both known port items). End-to-end decode on an iGPU is **not measured yet** -
-that needs a Flash-Next download on the machine, and the 35B `qwen35moe` family is CUDA/HIP only.
+number with the dense projections, the attention and the sampling offloaded to the iGPU. The parity suite passes on a
+UHD 770 **31 of 34**; the three that do not are:
+
+| test | why |
+|---|---|
+| `ple_parity` | needs the 28.8 GB Q2_0 shard-2 GGUF as a fixture (not a failure) |
+| `iq_parity` | Q3_K's multi-column mmvq is not bitwise equal to its one-column calls: Q3_K's single-column call goes through a dedicated kernel and the multi-column one through the generic kernel, so the sums run in a different order. No Strata model uses Q3_K. |
+| `s2_expert_grouped_parity` | the grouped expert kernel sums in a different order than the per-hit kernel it replaces (FMA contraction differs on this compiler). Both are within 1e-7 of the test's own double-precision reference, and the engine picks one path per run, so a run is deterministic - it just does not produce CUDA's last bits. |
+
+`gr_parity`'s fused q8_1 write (STRATA_QFUSE) also came on for the port and is byte-exact. End-to-end decode on an
+iGPU is **not measured yet** - that needs a Flash-Next download on the machine - and the 35B `qwen35moe` family
+(Cyber-Tiel, Qwen3.6-35B-A3B) is CUDA/HIP only, so it does not run on Intel at all.
 
 **Not supported:** an iGPU that the Level Zero runtime does not list (`sycl-ls` shows nothing), and Windows.
 
