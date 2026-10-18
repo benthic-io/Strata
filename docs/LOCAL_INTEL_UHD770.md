@@ -95,3 +95,17 @@ model cannot be executed. The same method applies to the other members of the
   mismatches in rope/gr/shared_expert/ple.
 - Next: split 1024-wide launches into 512 (or smaller) groups and adjust grid
   sizes and per-thread loops, then re-run parity.
+
+## Latest parity (with IGC FP64 emulation, work groups reduced to 512)
+
+Passing: bf16_gemv, cvec, dequant_s2, elementwise, gdn, kv_q4, kv_q8, kv_steps,
+native_grouped, native_multi, qsa, quantize_act, rope, router_top10, s2_gemv,
+s2_gemv_q8, s_gemv, s_gemv_q8k, sampler, shared_expert, verify, conversation_snapshot,
+sycl_router_fast, sycl_payload_pairs.
+
+Remaining failures:
+- `gr_parity`: fused GR read + q8_1 (STRATA_QFUSE) direct/graph replays not written.
+- `kv_stream_parity`: work-group size of 1024 exceeds the device max of 512; the
+  resolve kernel needs a 512-thread rewrite that preserves the 1024-slot clock sweep.
+- `ple_parity`: skipped (needs the Q2_0 shard 2 GGUF).
+- `s2_expert_grouped_parity`: 4 numerical failures.
