@@ -208,7 +208,7 @@ __dpct_inline__ void s_gemv_q8_split_kernel(
     // **THIS IS THE EXPERIMENT THE `#pragma unroll` NOTE BELOW LEFT OPEN**, and the note said what it would
     // be: "Widening QE to 8 or 16 changes the LOADS THEMSELVES - two or four independent 16-bit words per
     // lane - which an unroll cannot do because the extraction code is written for exactly four codes."  So a
-    // lane now takes a float quad: two code words issued before either is consumed, which is what raises the
+    // lane now takes a double quad: two code words issued before either is consumed, which is what raises the
     // bytes in flight.  The scale and offset are still ONE load, because eight consecutive elements lie in one
     // group whenever `group_elems % 8 == 0` - the launcher asserts that, and every group size this format
     // defines (16, 32, 64) satisfies it.

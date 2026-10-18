@@ -62,9 +62,9 @@ __dpct_inline__ void store_activation(uint16_t *dst, int i, float x) {
     dst[i] = f32_to_bf16_bits(x);
 }
 
-/// silu and sigmoid exactly as `ref/gr.py` writes them - in FLOAT, not float.
+/// silu and sigmoid exactly as `ref/gr.py` writes them - in FLOAT, not double.
 ///
-/// This is the opposite of `shared_expert.cu`, which uses float, and the difference is not stylistic:
+/// This is the opposite of `shared_expert.cu`, which uses double, and the difference is not stylistic:
 /// `ref/gr.py`'s arrays are float32, so `x / (1.0 + np.exp(-x))` evaluates in float32 under NEP 50, while
 /// `ref/moe.py` works in float64.  Matching the reference's PRECISION is part of transcribing it.
 __dpct_inline__ float silu_f(float x) {
@@ -74,7 +74,7 @@ __dpct_inline__ float sigmoid_f(float x) {
     return 1.0f / (1.0f + sycl::native::exp(-x));
 }
 
-__dpct_inline__ float warp_sum(float v) {
+__dpct_inline__ double warp_sum(double v) {
     /*
 DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
 masked sub_group function which may not be supported by all compilers or
@@ -131,12 +131,12 @@ function/algorithm is initialized.
 }
 
 /// The FP32 block-wide sum, for the reason the review's G5 states: this is a GeForce part and FP64 runs at a
-/// small fraction of FP32, so a `float` reduction turns a bandwidth kernel into a latency kernel.
+/// small fraction of FP32, so a `double` reduction turns a bandwidth kernel into a latency kernel.
 ///
-/// The scratch is taken as `float*` and reinterpreted as `float*` rather than changing the callers' shared
-/// arrays, because `float scratch[8]` is 64 bytes and so is at least as large as the `float[8]` this needs -
+/// The scratch is taken as `double*` and reinterpreted as `float*` rather than changing the callers' shared
+/// arrays, because `double scratch[8]` is 64 bytes and so is at least as large as the `float[8]` this needs -
 /// the cast cannot overrun, and it keeps the change to one function instead of one per caller.
-inline float block_sumf(float v, float *scratch_raw) {
+inline float block_sumf(float v, double *scratch_raw) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     float *scratch = (float *)scratch_raw;
     // The leading barrier is not decoration - see the note on `block_sum` above: the result is read straight out
@@ -181,7 +181,7 @@ inline float block_sumf(float v, float *scratch_raw) {
 /// The leading `__syncthreads()` is not decoration: the result is read straight out of `scratch[0]` by every
 /// thread, and a later call reuses the same array.  Without a barrier on entry a fast thread can overwrite
 /// `scratch[0]` before a slow one has read the previous result - a race that is invisible in most runs.
-float block_sum(float v, float* scratch) {
+double block_sum(double v, double* scratch) {
     /*
     DPCT1065: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
@@ -228,7 +228,7 @@ __dpct_inline__ void gr_norm_kernel(const float *__restrict__ R,
                                     int n_embd, float *__restrict__ xn,
                                     uint16_t *__restrict__ xq) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[8]>(
+auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
     sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const int c = item_ct1.get_group(2);
     const float* Rc = R + (size_t) c * n_embd;
@@ -236,7 +236,7 @@ auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[8]>(
     uint16_t* xqc = xq + (size_t) c * n_embd;
 
     // FP32, for the same reason as `gr_down_kernel` and `gr_inject_kernel`: this is a GeForce part, FP64 runs
-    // at a small fraction of FP32, and the sum of squares is a pure reduction.  It was the last `float` on the
+    // at a small fraction of FP32, and the sum of squares is a pure reduction.  It was the last `double` on the
     // `gr_read` path.  `gr_norm` is only 0.80 ms/token, so this is hygiene rather than a headline - but it is
     // 12 of the FP64 sites the review's G5 counted in this file, and the rule it states ("no FP64 on any decode
     // or prefill path") is worth being able to check mechanically rather than case by case.
@@ -285,14 +285,14 @@ __dpct_inline__ void gr_down_kernel(const Activation *__restrict__ xq,
     // whole-call figure is an average over kernels that do not share a rate.
     // **FP32, AND THE FP64 THAT WAS HERE COST MORE THAN EVERYTHING ELSE IN `gr_read`.**
     //
-    // This accumulated in `float`.  GeForce Blackwell executes FP64 at a small fraction of FP32 - 1/64 on
+    // This accumulated in `double`.  GeForce Blackwell executes FP64 at a small fraction of FP32 - 1/64 on
     // recent parts - so a 320-step dependent FP64 chain per lane turned a memory-bound reduction into a
     // latency-bound one.  The `nsys` per-kernel table (round 2) measured it at **5.07 ms/token, 15.3% of all
     // GPU time**, against `gr_gate_kernel`'s 1.23 ms - which REFUTES the comment that used to sit here, that
     // "gr_read's ~93 us is mostly the gate kernel at its own memory rate".  It was not: down + inject were
     // 8.77 of gr_read's 10.8 ms, and the gate was 1.23.
     //
-    // The justification for `float` was matching `ref/gr.py`'s float64 transcription.  **The ground truth is
+    // The justification for `double` was matching `ref/gr.py`'s float64 transcription.  **The ground truth is
     // llama.cpp, and llama.cpp accumulates in FP32** - so this does not move away from the oracle, it moves
     // toward it, and the review's G1 lists it first.
     //

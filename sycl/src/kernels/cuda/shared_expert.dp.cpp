@@ -60,7 +60,7 @@ __dpct_inline__ void swiglu_kernel(const float *__restrict__ gate,
     const int i = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
                   item_ct1.get_local_id(2);
     if (i >= n) return;
-    const float x = (float) gate[i];
+    const double x = (double) gate[i];
     out[i] = (float)(x / (1.0 + sycl::exp(-x))) * up[i];
 }
 
@@ -88,7 +88,7 @@ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int
 //
 // **ONE THREAD WAS THE LARGEST SINGLE KERNEL IN THE MODEL, AND THE COMMENT DEFENDING IT SAID WHY IT SHOULD
 // NOT BE.**  It read: "n_embd is 2560, so this is a short serial loop and the parallelism is elsewhere."
-// 2560 iterations is not short when each one is a DOUBLE multiply-add.  This card's float rate is **1/64** of
+// 2560 iterations is not short when each one is a DOUBLE multiply-add.  This card's double rate is **1/64** of
 // its float rate, so the loop is a 2560-long dependency chain through a 1/64-rate unit - tens of microseconds
 // from the chain alone, before counting 2560 sequential global loads issued by one thread with no coalescing.
 //
@@ -112,7 +112,7 @@ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int
 //
 // A wrong scalar here is the quiet failure mode: sigmoid bounds the damage to [0,1], so a gate that should be
 // 0.5 and reads 1.0 scales the shared expert by 2x and produces perfectly finite, perfectly plausible logits.
-__dpct_inline__ float warp_sum_d(float v) {
+__dpct_inline__ double warp_sum_d(double v) {
     /*
 DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
 masked sub_group function which may not be supported by all compilers or
@@ -144,14 +144,14 @@ __dpct_inline__ void scalar_gate_kernel(const uint16_t *__restrict__ x_bf16,
                                         const uint16_t *__restrict__ w_bf16,
                                         float *__restrict__ out, int n_embd) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[8]>(
+auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
     sycl::ext::oneapi::this_work_item::get_work_group<
         3>()); // 8 warps: the launch is <<<1, 256>>>
-    float acc = 0.0;
+    double acc = 0.0;
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < n_embd;
          i += item_ct1.get_local_range(2))
-        acc += (float) f32_from_bf16(x_bf16[i]) * (float) f32_from_bf16(w_bf16[i]);
+        acc += (double) f32_from_bf16(x_bf16[i]) * (double) f32_from_bf16(w_bf16[i]);
     item_ct1.barrier(sycl::access::fence_space::local_space);
     const int lane = item_ct1.get_local_id(2) & 31,
               warp = item_ct1.get_local_id(2) >> 5;
@@ -204,12 +204,12 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ parts,
     if (j >= n_embd) return;
     // Accumulate in DOUBLE, in the reference's own order (`for i in range(k): out[t] += w[t,i] * g[0]`).
     // f32 would be defensible for ten terms, but the reference is float64 and this is one line.
-    float acc = 0.0;
+    double acc = 0.0;
 #pragma unroll
     for (int e = 0; e < k; ++e) acc +=
-        (float)weights[e] * (float)parts[(size_t)e * n_embd + j];
+        (double)weights[e] * (double)parts[(size_t)e * n_embd + j];
     // The SHARED output is added PLAIN - not router-weighted, not renormalised against the routed sum.
-    if (has_shared) acc += (float) shared[j];
+    if (has_shared) acc += (double) shared[j];
     y[j] = (float) acc;
 }
 

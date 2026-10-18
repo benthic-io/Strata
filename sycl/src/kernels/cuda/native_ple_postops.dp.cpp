@@ -177,7 +177,7 @@ __dpct_inline__ void rms_rep_kernel(const float *__restrict__ input,
                                     float *__restrict__ output) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int BlockSize =
-        1024; // native_gr_rms_norm_weighted's choice for 2560 columns
+        512; // native_gr_rms_norm_weighted's choice for 2560 columns
     const int tid = item_ct1.get_local_id(2);
     const size_t row_offset = size_t(item_ct1.get_group(2)) * N;
     input += row_offset;
@@ -410,8 +410,8 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
             sycl::ext::oneapi::experimental::use_root_sync};
 
         st->parallel_for<dpct_kernel_name<class rms_rep_kernel_dde36c>>(
-            sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 1024),
-                              sycl::range(1, 1, 1024)),
+            sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 512),
+                              sycl::range(1, 1, 512)),
             exp_props,
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
                 rms_rep_kernel(key, w.norm_key, key);
@@ -427,8 +427,8 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
             sycl::ext::oneapi::experimental::use_root_sync};
 
         st->parallel_for<dpct_kernel_name<class rms_rep_kernel_9b5d94>>(
-            sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 1024),
-                              sycl::range(1, 1, 1024)),
+            sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 512),
+                              sycl::range(1, 1, 512)),
             exp_props,
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
                 rms_rep_kernel(hidden, w.norm_query, query_norm);
@@ -480,8 +480,8 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
             sycl::ext::oneapi::experimental::use_root_sync};
 
         st->parallel_for<dpct_kernel_name<class rms_rep_kernel_e4e0bd>>(
-            sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 1024),
-                              sycl::range(1, 1, 1024)),
+            sycl::nd_range<3>(sycl::range(1, 1, rows) * sycl::range(1, 1, 512),
+                              sycl::range(1, 1, 512)),
             exp_props,
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
                 rms_rep_kernel(gated, w.norm_conv, query_norm);
