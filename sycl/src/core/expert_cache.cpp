@@ -5,6 +5,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/sycl_unified.hpp"
 #include "strata/core/expert_cache.hpp"
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
@@ -108,11 +109,11 @@ size_t device_free_bytes() try {
             dev >= 0 && dev < 64) {
             int c = uma_cache[dev].load(std::memory_order_acquire);
             if (c == 0) {
-                c = DPCT_CHECK_ERROR(
-                        v = dpct::get_device(dev).get_integrated()) == 0 &&
-                            v
-                        ? 1
-                        : 2;
+                // SYCL has no cudaDevAttrIntegrated and dpct's get_integrated() is 0 in this build, so the port asks
+                // the runtime for the device's PCI address and applies the rule setup_intel.py uses (an integrated
+                // part is the platform's graphics at 00:02.0).  Without it an iGPU's "free" memory would be the free
+                // RAM and the cache would be sized from that.
+                c = strata::sycl_detail::unified_memory_device(dpct::get_device(dev)) ? 1 : 2;
                 uma_cache[dev].store(c, std::memory_order_release);
             }
             unified_memory = c == 1;
@@ -640,6 +641,21 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
                           (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
                           (double) free_b / 1073741824.0, (double) (total_b - free_b) / 1073741824.0,
                           (double) total_b / 1073741824.0);
+            err = buf;
+            return false;
+        }
+        // SYCL port: free memory is not the same as a memory this driver will hand out in one piece.  Level Zero
+        // caps a single allocation at 4 GiB on the consumer parts, so say that here rather than letting the
+        // allocation below fail with a bare "out of memory".
+        const size_t cap = strata::sycl_detail::max_single_alloc_bytes(dpct::get_current_device());
+        if (cap > 0 && want > cap) {
+            char buf[320];
+            std::snprintf(buf, sizeof buf,
+                          "ExpertCache: %lld slots x %lld B = %.2f GiB, but this driver caps one allocation at "
+                          "%.2f GiB (the card has %.2f GiB free). Lower --expert-cache to %lld slots.",
+                          (long long) n_slots, (long long) blob_bytes, (double) want / 1073741824.0,
+                          (double) cap / 1073741824.0, (double) free_b / 1073741824.0,
+                          (long long) (cap / (size_t) blob_bytes));
             err = buf;
             return false;
         }
