@@ -53,10 +53,49 @@ INTEL_ARC = {"e223": ("Arc Pro B70", 32.0), "e221": ("Arc Pro B60", 24.0), "e211
 # built in chunks past that limit and the A-series uses the ordinary streamed path; see to_sycl().
 ALCHEMIST_IDS = frozenset({"56a0", "56a1", "56a2", "56a5", "56a6", "5690"})
 
+# An INTEGRATED part (Intel's own graphics in a desktop or laptop) has no VRAM: the memory it can address is a window
+# on system RAM (the driver's GTT pool). Its memory BARs do not tell it apart from a discrete card - a UHD 770 publishes
+# a full 4 GiB aperture, as large as an Arc's - so it is recognised by where it sits instead: on an Intel client
+# platform the integrated graphics is always PCI 00:02.0, the "Internal Graphics" device, while a discrete card hangs
+# off a PCIe bridge. A known Arc id in INTEL_ARC is a discrete card wherever it sits. Set
+# STRATA_EXPERIMENTAL_INTEL_IGPU=1 to take any other 8086 id as integrated (the same opt-in the AMD APU ids use).
+# An integrated GPU runs the port's i915 path (the experts in a RAM arena, the CPU computing the ones the card does
+# not hold), which is the only shape that fits: the experts are the model's bulk and they live in RAM either way.
+INTEL_IGPU_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_INTEL_IGPU") == "1"
+UMA_OS_LEFT_GB = 6       # the share of the unified memory kept for the OS (setup.py's AMD APU rule)
+PLE_TABLE_GB = 28.8      # the Flash-Next per-layer n-gram table setup.py's own fallback uses
+
+
+def is_internal_graphics(dev: Path) -> bool:
+    """True when this device is the platform's own graphics: PCI 00:02.0, where Intel puts the integrated GPU on every
+    client part. A discrete card is behind a PCIe bridge, so it sits at another bus or another device number. The
+    sysfs path carries the address as `0000:00:02.0` (domain:bus:device.function)."""
+    for p in dev.resolve().parts:
+        f = p.split(":")
+        if len(f) != 3 or not f[0].startswith("0000"):
+            continue
+        try:
+            bus, dev_no = int(f[1], 16), int(f[2].split(".")[0], 16)
+        except ValueError:
+            continue
+        return bus == 0 and dev_no == 0x02
+    return False
+
+
+def integrated_memory(g: dict) -> dict:
+    """An integrated GPU's 'VRAM' is a window on system RAM, not room beside it: the shared pool (half the RAM unless
+    the kernel was told otherwise, less the share the OS keeps - setup.py's APU rule, which sizes the context and the
+    parallel slots from it). The dedicated part is 0: the model's experts sit in RAM on this path anyway."""
+    ram = S.ram_gb()
+    shared = max(0.0, min(ram / 2, ram - UMA_OS_LEFT_GB))
+    g.update({"uma": True, "integrated": True, "dedicated_gb": 0.0, "shared_gb": shared, "vram_gb": shared})
+    return g
+
 
 def intel_gpus():
-    """Intel discrete GPUs from sysfs: vendor 0x8086 under the xe or i915 driver, named by PCI device id. VRAM comes
-    from the id table, else from the size of the card's VRAM BAR."""
+    """Intel GPUs from sysfs: vendor 0x8086 under the xe or i915 driver, named by PCI device id. A known Arc id is a
+    discrete card and its VRAM comes from the id table; anything else at PCI 00:02.0 (or any other 8086 id with
+    STRATA_EXPERIMENTAL_INTEL_IGPU=1) is the platform's integrated graphics and is sized from the RAM it shares."""
     found = []
     for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
         if "-" in card.name:                            # connectors (card0-DP-1) share the card's device
@@ -72,9 +111,13 @@ def intel_gpus():
             continue
         name, vram = INTEL_ARC.get(devid, (None, 0.0))
         if name is None:
-            if driver != "xe":                          # i915 without a known Arc id is an integrated GPU
-                continue
-            name = f"Intel GPU {devid} (xe)"
+            if not (is_internal_graphics(dev) or INTEL_IGPU_OPT_IN):
+                continue                                # an 8086 GPU we cannot place: leave it alone
+            name = f"integrated GPU {devid} ({driver})"
+            g = {"index": len(found), "name": f"Intel {name}", "vram_gb": 0.0, "arch": driver, "driver": driver,
+                 "devid": devid}
+            found.append(integrated_memory(g))
+            continue
         if not vram:                                    # resource line 2 (BAR 2) is the VRAM aperture on xe cards
             try:
                 start, end, _ = (dev / "resource").read_text().splitlines()[2].split()
@@ -127,8 +170,10 @@ SMALL_CARD_GB = 12.0       # under this the engine's own advice is --vram-reserv
 SMALL_RESERVE_MIB = 300
 
 
-def small_card(vram_gb: float, driver: str) -> bool:
-    return 0 < vram_gb < SMALL_CARD_GB or driver == "i915"
+def small_card(vram_gb: float, driver: str, integrated: bool = False) -> bool:
+    """A card the engine's own small-card advice fits: under 12 GB, or an i915 card (the A-series, whose pinned-host
+    allocations fail past a few GB). An integrated GPU is NOT small in that sense: its 'VRAM' is the RAM."""
+    return not integrated and (0 < vram_gb < SMALL_CARD_GB or driver == "i915")
 
 
 # #1980: on a layer split the host mirror covers the first stage only, so with STRATA_VERIFY_NO_HOST=1 (strata-sycl.sh's
@@ -146,7 +191,7 @@ def split_likely_short(arena_gb: float, vram_gbs: list) -> bool:
 
 
 def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, driver: str = "xe",
-            devid: str = "") -> dict:
+            devid: str = "", integrated: bool = False, model: str = "") -> dict:
     """setup's config (written for its HIP path) -> the SYCL port's: the container's paths, experts streamed from the
     GGUF into VRAM (--stream-experts: the engine reads them from the GGUF and keeps what does not fit in a pinned RAM
     mirror; the VRAM reserve is the smallest that leaves the KV and the prompt buffers room - docs/INTEL.md), KV
@@ -164,7 +209,10 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
     for f in ("--resident-experts", "--mmap-experts"):  # setup's low-RAM mode is the CUDA engine's
         drop(args, f)
     drop(args, "--kv-resident", True)                   # decided below on the real RAM
-    if driver != "i915" and "--expert-profile" in args and (ROOT / "data" / SYCL_PROFILE).is_file():
+    # The i915 path (and an integrated GPU, which runs it) has the CPU compute the experts the card does not hold, so
+    # WHICH experts the cache holds moves roundings there and the sycl ranking does not apply.
+    host_experts = driver == "i915" or integrated
+    if not host_experts and "--expert-profile" in args and (ROOT / "data" / SYCL_PROFILE).is_file():
         # 0.1.43: a card on xe runs every expert on the GPU (the ones the cache does not hold are read from the pinned mirror
         # by the same kernels), so WHICH experts the cache holds changes speed and no token: data/expert-profile-sycl.bin
         # ranks them from the routing of 45 varied prompts (chat, code, maths, six languages) and eight document summaries,
@@ -186,14 +234,27 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         args += ["--kv-resident", "32768"]
     asked_reserve = flag(args, "--vram-reserve-mib")    # setup writes it only when the user gave it
     drop(args, "--vram-reserve-mib", True)
-    reserve = asked_reserve or (str(SMALL_RESERVE_MIB) if small_card(vram_gb, driver) else
+    reserve = asked_reserve or (str(SMALL_RESERVE_MIB) if small_card(vram_gb, driver, integrated) else
                                 "1024" if ctx <= 32768 else "2048")
-    alchemist = driver == "i915" or devid in ALCHEMIST_IDS
-    if driver == "i915":
-        # Arc A-series on i915 (the A750): the experts load into an ordinary RAM arena and the CPU computes the ones
-        # the card does not hold; the n-gram table is kept in RAM (setup's rotational-disk rule) and no mirror is built.
+    alchemist = driver == "i915" or devid in ALCHEMIST_IDS or integrated
+    if host_experts:
+        # Arc A-series on i915 (the A750), and an integrated GPU: the experts load into an ordinary RAM arena and the
+        # CPU computes the ones the card does not hold; no mirror is built. The GPU's own memory then holds only the
+        # dense weights, the KV and the prompt buffers, which is what fits in a shared window.
+        #
+        # The n-gram table (28.8 GB) is kept in RAM only when the RAM has room for it beside the arena: on this path
+        # the arena already holds every expert, and --ple-io ram locks the whole table, so on a PC where the two do
+        # not both fit it would swap. setup.py makes the same call for a rotational disk (#605); there it reads it
+        # from RAM because the disk is slow, and here the engine's default (direct reads from the SSD) is the better
+        # of the two when the RAM cannot hold it.
         if "--ple-io" not in args:
-            args += ["--ple-io", "ram"]
+            need_ram = S.MODELS.get(model, {}).get("ram_gb", 0) if integrated else 0
+            if integrated and not (need_ram and ram >= need_ram + PLE_TABLE_GB + 4):
+                S.say(f"  the n-gram table (about {PLE_TABLE_GB:.0f} GB) is read from the SSD, not kept in RAM: this PC "
+                      f"has {ram:.0f} GB and the experts already need about {need_ram:.0f} GB of it. Add "
+                      "--ple-io ram to the config's args if the machine has the RAM for both")
+            else:
+                args += ["--ple-io", "ram"]
         args += ["--vram-reserve-mib", reserve]
     else:
         args += ["--stream-experts", "--vram-reserve-mib", reserve]
@@ -206,9 +267,10 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
     out.update({"backend": "sycl", "exe": str(SYCL_WRAPPER), "args": args, "sycl_root": str(MOUNT)})
     env = {}
     if alchemist:
-        if driver == "i915":
-            # on i915 the CPU computes the misses and the GPU waits for them at every layer (NO_HOST=0). On xe the
-            # experts are streamed and the mirror is used, so strata-sycl.sh's NO_HOST=1 default stands.
+        if host_experts:
+            # on i915 (and an integrated GPU) the CPU computes the misses and the GPU waits for them at every layer
+            # (NO_HOST=0). On xe the experts are streamed and the mirror is used, so strata-sycl.sh's NO_HOST=1
+            # default stands.
             env["STRATA_VERIFY_NO_HOST"] = "0"
         # an Alchemist has no FP64 hardware: a kernel that declares double (one is on the sampled path) is refused at its
         # first launch - "'double' is not supported in ... device", the engine dies on the first request with a
@@ -227,7 +289,8 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
 def install(argv) -> None:
     intel = [] if S.WIN else intel_gpus()
     if not intel:
-        S.fail("no Intel Arc found (an xe or i915 card in /sys/class/drm)", "on an NVIDIA or AMD card, run ./setup.sh")
+        S.fail("no Intel GPU found (an xe or i915 card in /sys/class/drm)",
+               "on an NVIDIA or AMD card, run ./setup.sh")
     exe, why = sycl_engine()
     if exe is None:
         S.fail(f"Strata's SYCL engine cannot be used: {why}", "docs/INTEL.md: build it, then run this again")
@@ -237,6 +300,13 @@ def install(argv) -> None:
             S.fail(f"setup.py has no {name}() any more: sycl/setup_intel.py needs updating for this setup.py")
 
     real_ram = S.ram_gb()
+    integrated = bool(intel[0].get("integrated"))
+    if integrated:
+        g0 = intel[0]
+        S.warn(f"an INTEGRATED Intel GPU ({g0['name']}, no VRAM of its own) was found. The SYCL port runs on it "
+               f"through the same path as an i915 Arc: the experts stay in RAM and the CPU computes the ones the "
+               f"card does not hold, so this is a small-but-complete run of a Flash-Next size, not a fast one. "
+               f"docs/INTEL.md has the measurements")
     keep = {}                                           # hand-set keys setup does not write: kept across a rerun
     for p in ROOT.glob("strata-*.json"):
         try:
@@ -250,7 +320,7 @@ def install(argv) -> None:
 
     say = S.say
     fake_ram = max(real_ram, 1024.0)
-    alch = intel[0]["driver"] == "i915" or intel[0].get("devid") in ALCHEMIST_IDS
+    alch = intel[0]["driver"] == "i915" or intel[0].get("devid") in ALCHEMIST_IDS or integrated
 
     def say_intel(msg=""):
         """setup's words for its AMD path and its RAM rule, said for the Intel card."""
@@ -264,9 +334,12 @@ def install(argv) -> None:
             m = msg.split()[0]
             d = S.MODELS.get(m, {})
             shard1 = d.get("download_gb", 0) - 28.8          # all but the per-layer lookup table (read from disk)
-            room = intel[0]["vram_gb"] - 3 + max(0.0, real_ram - 10)   # VRAM, plus a pinned host mirror (or the CPU)
+            # Memory the GPU can hold BESIDE the RAM. On an integrated part that is nothing: its 'VRAM' is the RAM the
+            # experts already live in, so no size 'fits in VRAM' there and the verdict is always the CPU one.
+            vram = S.low_ram_vram(intel[0])
+            room = vram - 3 + max(0.0, real_ram - 10)        # that VRAM, plus a pinned host mirror (or the CPU)
             msg = (f"  {m:8s} ~{shard1:.0f} GB of weights: " +
-                   ("fits in VRAM" if shard1 <= intel[0]["vram_gb"] - 1.5 else
+                   ("fits in VRAM" if shard1 <= vram - 1.5 else
                     "fits, the experts the card does not hold are computed on the CPU (slower)" if alch and shard1 <= room else
                     "fits with part of its experts mirrored in RAM (slower)" if shard1 <= room else "does not fit"))
         say(msg)
@@ -299,7 +372,7 @@ def install(argv) -> None:
         idx = gsel if isinstance(gsel, int) and 0 <= gsel < len(intel) else 0
         sel = intel[idx]
         cfg = to_sycl(cfg, exe, real_ram, keep.get(Path(cfg_path).name, {}), sel["vram_gb"], sel["driver"],
-                      sel.get("devid", ""))
+                      sel.get("devid", ""), bool(sel.get("integrated")), model)
         if len(intel) > 1:                                  # pin the SYCL device(s)
             # the Level Zero order followed the sysfs card order on the tested machines; a machine where it does not
             # needs an explicit ONEAPI_DEVICE_SELECTOR (kept if the user set one)
@@ -320,9 +393,9 @@ def install(argv) -> None:
                       "experts the later card does not hold instead of the start being refused (#1980). Set it to 1 "
                       "in the config's env if your cards hold everything; a smaller model fits fully (docs/INTEL_ARC.md)")
         need = S.MODELS.get(model, {}).get("ram_gb", 0)
-        sel_alch = sel["driver"] == "i915" or sel.get("devid") in ALCHEMIST_IDS
+        sel_alch = sel["driver"] == "i915" or sel.get("devid") in ALCHEMIST_IDS or sel.get("integrated")
         if sel_alch and need and real_ram < need:
-            S.warn(f"{model} on this Arc computes the experts the card does not hold on the CPU (about {need} GB of "
+            S.warn(f"{model} on this GPU computes the experts the card does not hold on the CPU (about {need} GB of "
                    f"weights; this PC has {real_ram:.0f} GB of RAM): the start will be slow or fail - a smaller model "
                    "(--model) fits better (docs/INTEL.md)")
         Path(cfg_path).write_text(json.dumps(cfg, indent=1), encoding="utf-8")
@@ -343,7 +416,7 @@ def install(argv) -> None:
     S.start = start_sycl
 
     argv = list(argv)
-    if small_card(intel[0]["vram_gb"], intel[0]["driver"]):   # the engine's own advice for a card this size
+    if small_card(intel[0]["vram_gb"], intel[0]["driver"], integrated):   # the engine's advice for a card this size
         if "--draft-vocab" not in argv:
             argv += ["--draft-vocab", "en"]             # ~110 MiB less VRAM than the default CJK subset
         if "--vram-reserve-mib" not in argv:

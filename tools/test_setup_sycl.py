@@ -222,6 +222,59 @@ class ToSycl(unittest.TestCase):
         self.assertTrue(m.small_card(24.0, "i915"))
         self.assertTrue(m.small_card(10.0, "xe"))
         self.assertFalse(m.small_card(32.0, "xe"))
+        # an integrated GPU's "VRAM" is the RAM, so the small-card advice (a 300 MiB reserve, the English draft
+        # vocabulary) does not apply to it however small the shared window is
+        self.assertFalse(m.small_card(8.0, "i915", True))
+        self.assertFalse(m.small_card(31.0, "i915", True))
+
+    def test_an_integrated_gpu_is_the_platform_graphics_at_pci_00_02(self):
+        m = self.mod()
+        from pathlib import Path
+        # this machine's UHD 770 sits at 00:02.0; an Arc hangs off a PCIe bridge at 03:00.0
+        self.assertTrue(m.is_internal_graphics(Path("/sys/devices/pci0000:00/0000:00:02.0/drm/card1/device")))
+        self.assertFalse(m.is_internal_graphics(Path("/sys/devices/pci0000:00/0000:00:1c.0/0000:03:00.0/drm/card1/device")))
+        self.assertFalse(m.is_internal_graphics(Path("/tmp/card1/device")))   # no PCI address in the path: not claimed
+
+    def test_an_integrated_gpu_is_sized_from_the_ram_it_shares(self):
+        m = self.mod()
+        g = {"index": 0, "name": "Intel integrated GPU 4680 (i915)", "vram_gb": 0.0, "arch": "i915",
+             "driver": "i915", "devid": "4680"}
+        old_ram = m.S.ram_gb
+        m.S.ram_gb = lambda: 64.0
+        try:
+            g = m.integrated_memory(g)
+        finally:
+            m.S.ram_gb = old_ram
+        self.assertTrue(g["integrated"] and g["uma"])
+        self.assertEqual(g["dedicated_gb"], 0.0)             # no room BESIDE the RAM: the shared pool IS the RAM
+        self.assertEqual(g["shared_gb"], 32.0)               # half of it, setup.py's APU rule
+        self.assertEqual(g["vram_gb"], 32.0)
+
+    def test_an_integrated_gpu_computes_the_misses_on_the_cpu(self):
+        m = self.mod()
+        c = m.to_sycl(self.cfg(m), m.ROOT / "build-sycl" / "strata", 64.0, {}, 31.0, "i915", "4680", True, "IQ1_M")
+        self.assertNotIn("--stream-experts", c["args"])       # the experts stay in RAM
+        self.assertEqual(c["env"]["STRATA_VERIFY_NO_HOST"], "0")
+        # FP64 is emulated on an integrated GPU too, exactly as on the A-series
+        self.assertEqual(c["env"]["IGC_EnableDPEmulation"], "1")
+        # and it is not given the small-card reserve
+        self.assertEqual(c["args"][c["args"].index("--vram-reserve-mib") + 1], "1024")
+        shipped = str(m.MOUNT / "data" / "expert-profile.bin")
+        c = m.to_sycl(self.cfg(m, ["--expert-profile", shipped]), m.ROOT / "build-sycl" / "strata", 64.0, {},
+                      31.0, "xe", "abcd", True, "IQ1_M")
+        self.assertTrue(c["args"][c["args"].index("--expert-profile") + 1].endswith("expert-profile.bin"))
+
+    def test_an_integrated_gpu_does_not_lock_the_ngram_table_when_the_ram_is_short(self):
+        m = self.mod()
+        # IQ1_M needs ~32 GB of RAM and the table is 28.8 GB: a 40 GB PC must read the table from the SSD
+        c = m.to_sycl(self.cfg(m), m.ROOT / "build-sycl" / "strata", 40.0, {}, 31.0, "i915", "4680", True, "IQ1_M")
+        self.assertNotIn("--ple-io", c["args"])
+        # with the room for both it is kept in RAM, as on a discrete i915 card
+        c = m.to_sycl(self.cfg(m), m.ROOT / "build-sycl" / "strata", 128.0, {}, 31.0, "i915", "4680", True, "IQ1_M")
+        self.assertEqual(c["args"][c["args"].index("--ple-io") + 1], "ram")
+        # the discrete i915 A750 keeps its own behaviour whatever the RAM
+        c = m.to_sycl(self.cfg(m), m.ROOT / "build-sycl" / "strata", 40.0, {}, 8.0, "i915", "56a1", False, "IQ1_M")
+        self.assertEqual(c["args"][c["args"].index("--ple-io") + 1], "ram")
 
 
 if __name__ == "__main__":
