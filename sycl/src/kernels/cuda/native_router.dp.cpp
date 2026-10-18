@@ -67,6 +67,71 @@ exceeds 128 bytes and may cause high register pressure. Consult with your
 hardware vendor to find the total register size available and adjust the code,
 or use smaller sub-group size to avoid high register pressure.
 */
+template <int NE, int K>   // SYCL port: the generic (experts, k) router, one warp per token
+__dpct_inline__ void route_topk(const float *__restrict__ logits,
+                                int32_t *__restrict__ ids,
+                                float *__restrict__ weights, int n_tok) {
+    static_assert(NE % 32 == 0 && K <= 32, "experts in whole warps, at most 32 picks");
+    constexpr int V = NE / 32;
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int tk = (int)item_ct1.get_group(2) * 8 + (int)item_ct1.get_local_id(1);
+    if (tk >= n_tok) return;
+    logits += (size_t)tk * NE; ids += (size_t)tk * K; weights += (size_t)tk * K;
+    const int lane = item_ct1.get_local_id(2);
+    float values[V];
+#pragma unroll
+    for (int i = 0; i < V; ++i) values[i] = logits[lane + i * 32];
+    float maximum = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < V; ++i) maximum = sycl::max(maximum, values[i]);
+    maximum = warp_max(maximum);
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < V; ++i) {
+        values[i] = sycl::native::exp(values[i] - maximum);
+        sum += values[i];
+    }
+    const float reciprocal = 1.0f / warp_sum(sum);
+#pragma unroll
+    for (int i = 0; i < V; ++i) {
+        values[i] *= reciprocal;
+        if (sycl::isnan(values[i])) values[i] = -FLT_MAX;
+    }
+    float selected = 0.0f, selected_sum = 0.0f;
+    for (int rank = 0; rank < K; ++rank) {
+        float best = values[0];
+        int expert = lane;
+#pragma unroll
+        for (int i = 1; i < V; ++i) {
+            if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
+        }
+#pragma unroll
+        for (int mask = 16; mask; mask >>= 1) {
+            const float other = dpct::experimental::permute_sub_group_by_xor(
+                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
+                best, mask);
+            const int other_id = dpct::experimental::permute_sub_group_by_xor(
+                0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(),
+                expert, mask);
+            if (other > best || (other == best && other_id < expert)) { best = other; expert = other_id; }
+        }
+        if ((expert & 31) == lane) {
+            values[expert / 32] = -INFINITY;
+            ids[rank] = expert;
+            selected_sum += best;
+        }
+        if (rank == lane) selected = best;
+    }
+    selected_sum = sycl::max(warp_sum(selected_sum), 6.103515625e-5f);
+    const float inverse_selected_sum = 1.0f / selected_sum;
+    if (lane < K) weights[lane] = selected * inverse_selected_sum;
+}
+/*
+DPCT1110: The total declared local variable size in device function route
+exceeds 128 bytes and may cause high register pressure. Consult with your
+hardware vendor to find the total register size available and adjust the code,
+or use smaller sub-group size to avoid high register pressure.
+*/
 template <int NE>   // SYCL port: 512 (canonical) or 256 (the Coder) experts, 32 lanes x NE/32 values
 __dpct_inline__ void route(const float *__restrict__ logits,
                            int32_t *__restrict__ ids,
@@ -308,5 +373,36 @@ void native_router_top10_multi_ne(const float* logits, int32_t* ids, float* weig
         ->parallel_for<dpct_kernel_name<class route_256_multi>>(
             sycl::nd_range<3>(sycl::range(1, 1, (unsigned) n_tok) * sycl::range(1, 8, 32), sycl::range(1, 8, 32)),
             [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] { route<256>(logits, ids, weights); });
+}
+
+// The generic (experts, k) entry the qwen35moe family's router calls: Flash-Next's 512 x 10 keeps the pinned kernels,
+// everything else runs route_topk (256 x 8 is the qwen35moe router).  SYCL port: the wrapper was not in the port
+// because no ported engine asked for it until the qwen35moe path did; the kernel it launches (route_topk) was here.
+bool native_router_topk_supported(int n_expert, int k) {
+    return (n_expert == 512 && k == 10) || (n_expert == 256 && k == 8);
+}
+void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream) {
+    if (n_expert == 512 && k == 10) {   // Flash-Next: the pinned kernels above, unchanged
+        if (n_tok == 1) native_router_top10(logits, ids, weights, stream);
+        else native_router_top10_multi(logits, ids, weights, n_tok, stream);
+        return;
+    }
+    if (!stream || n_tok < 1 || !native_router_topk_supported(n_expert, k) ||
+        !valid(logits, (size_t) n_tok * n_expert * 4) || !valid(ids, (size_t) n_tok * k * 4) ||
+        !valid(weights, (size_t) n_tok * k * 4))
+        throw std::invalid_argument("native_router_topk: a stream, a supported (experts, k) and aligned buffers");
+    {
+        auto exp_props = sycl::ext::oneapi::experimental::properties{
+            sycl::ext::oneapi::experimental::use_root_sync};
+
+        ((sycl::queue *)(strata::q_of(stream)))
+            ->parallel_for<dpct_kernel_name<class route_topk_256_8>>(
+                sycl::nd_range<3>(sycl::range(1, 1, (unsigned) ((n_tok + 7) / 8)) * sycl::range(1, 8, 32),
+                                  sycl::range(1, 8, 32)),
+                exp_props,
+                [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                    route_topk<256, 8>(logits, ids, weights, n_tok);
+                });
+    }
 }
 }

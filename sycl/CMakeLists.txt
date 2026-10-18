@@ -250,6 +250,14 @@ strata_resolve(_main src/program/generate.cpp)
 add_executable(strata ${_main})
 target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
+# --- the qwen35moe family (Qwen3.6-35B-A3B and the models of its architecture): its own engine path -------------
+# src/qwen35/q36_engine.cu is a CUDA translation unit that `strata` switches to for a qwen35moe model.  The port
+# carries the migrated copy (sycl/src/qwen35/q36_engine.dp.cpp, dpct + the fixups in sycl/tools/fixups.py), which is
+# what lets the family run on an Intel GPU instead of being CUDA/HIP only.
+add_library(strata_qwen35 STATIC ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen35/q36_engine.dp.cpp)
+target_link_libraries(strata_qwen35 PRIVATE strata_prefill strata_kernels strata_engine)
+target_link_libraries(strata PRIVATE strata_qwen35)
+
 # --- the kernel parity self-tests (each runs on the card and compares against a CPU reference) ---------------------
 option(STRATA_SYCL_PARITY "Build the kernel parity tests" ON)
 if(STRATA_SYCL_PARITY)
