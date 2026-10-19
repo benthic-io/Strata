@@ -169,12 +169,12 @@ three (`iq_parity`, `ple_parity`, `s2_expert_grouped_parity`).
 
 Flags the port added on the way:
 
-- `--no-mtp-block`: run without the file's MTP draft block. Cyber-Tiel's (like Unsloth's UD-Q4_K_XL
-  for Qwen3.6) quantizes that block **Q3_K**, which no grouped-expert kernel takes, and that refused
-  the whole file for a layer that only ever produces drafts. Costs speculative decoding, nothing else.
 - `strata-q36` (the family's own entry point) as a build target, as in the CUDA build.
+- `--kv-q8` for int8 K/V cache (benthic-io PR #3084), FP16 by default.
 
-Measured once the Q3_K kernels exist, `--no-mtp-block` should stop being necessary.
+The MTP draft block (Q3_K experts) now runs natively via the new `vec_dot_q3_K_q8_1` kernel, so
+`--no-mtp-block` is no longer needed for Cyber-Tiel's UD-Q4_K_XL.  The kernel is scalar (no vmmq
+integer chain) - correct first, fast later. `--no-mtp-block` remains as an opt-out for the draft head.
 
 ## K/V cache: FP16 by default, int8 with `--kv-q8`
 
