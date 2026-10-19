@@ -175,3 +175,15 @@ Flags the port added on the way:
 - `strata-q36` (the family's own entry point) as a build target, as in the CUDA build.
 
 Measured once the Q3_K kernels exist, `--no-mtp-block` should stop being necessary.
+
+## K/V cache: FP16 by default, int8 with `--kv-q8`
+
+The port now carries benthic-io's PR #3084 (FP16 K/V cache by default, int8 with `--kv-q8`).
+The qwen35 engine stored its K/V cache in FP32 with no option; FP16 is now the default and
+`--kv-q8` stores int8 codes with one FP16 scale per 64 dims (the main engine's `kv_q8.hpp`
+scheme).  On a 16 GiB card that is the difference between 192K and 262144 cells.
+
+Both paths run and produce real tokens on the UHD 770; the decode rate is essentially the same
+(8.8-10.2 tok/s) because the iGPU is compute-bound on the expert GEMMs, not on the cache
+bandwidth - the saving shows up in how much context fits, not in tok/s.  Measuring the expert/iGPU
+split that the shared memory bus actually wants is the next piece of work.
