@@ -446,7 +446,7 @@ __dpct_inline__ float vec_dot_iq4_xs_q8_1(const void *__restrict__ vbq,
 // Q4_K / Q5_K gate/up and Q5_1 / Q8_0 down: llama.cpp's vec_dot_*_q8_1 (vecdotq.cuh, VDR 2 each), transcribed; the
 // Q5_1 min term is the one departure (below).  Via eddoursul/Strata 8029fa9 (iq_dot.cuh) and #255 (Q8_0,
 // gopinath87607), which agree with llama.cpp and with each other.
-constexpr int VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q5_1 = 2, VDR_Q5_0 = 2, VDR_Q4_1 = 2, VDR_Q4_0 = 2, VDR_Q8_0 = 2, VDR_Q6_K = 1;
+constexpr int VDR_Q3_K = 1, VDR_Q4_K = 2, VDR_Q5_K = 2, VDR_Q5_1 = 2, VDR_Q5_0 = 2, VDR_Q4_1 = 2, VDR_Q4_0 = 2, VDR_Q8_0 = 2, VDR_Q6_K = 1;
 
 __dpct_inline__ float vec_dot_q4_K_q8_1_impl_vmmq(
     const int *__restrict__ v, const int *__restrict__ u,
@@ -558,6 +558,38 @@ __dpct_inline__ float vec_dot_q5_K_q8_1(const void *__restrict__ vbq,
     }
     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
 }
+__dpct_inline__ float vec_dot_q3_K_q8_1(const void *__restrict__ vbq,
+                                        const block_q8_1 *__restrict__ bq8_1,
+                                        const int &kbx, const int &iqs) {
+    const block_q3_K* bq3 = (const block_q3_K*) vbq + kbx;
+    const block_q8_1* bq8 = bq8_1 + iqs;
+    // Unpack the 12 scale bytes into 16 6-bit scales (ggml's scheme).
+    uint32_t auxs[4];
+    std::memcpy(auxs, bq3->scales, 12);
+    auxs[3] = 0;
+    const uint32_t tmp = auxs[2];
+    auxs[2] = ((auxs[0] >> 4) & 0x0f0f0f0f) | (((tmp >> 4) & 0x03030303) << 4);
+    auxs[3] = ((auxs[1] >> 4) & 0x0f0f0f0f) | (((tmp >> 6) & 0x03030303) << 4);
+    auxs[0] = (auxs[0] & 0x0f0f0f0f) | (((tmp >> 0) & 0x03030303) << 4);
+    auxs[1] = (auxs[1] & 0x0f0f0f0f) | (((tmp >> 2) & 0x03030303) << 4);
+    const int8_t* scales = (const int8_t*) auxs;
+    const float d = (float) *reinterpret_cast<const sycl::half*>(&bq3->d);
+    const float d8 = bq8->ds[0];
+    float sum = 0.0f;
+    const int base = iqs * 32;
+    for (int l = 0; l < 32; ++l) {
+        const int p = base + l;
+        const int low2 = (bq3->qs[p / 4] >> (2 * (p % 4))) & 3;
+        const int high = (bq3->hmask[p / 8] >> (p % 8)) & 1;
+        int q = low2 | (high << 2);
+        if (!high) q -= 4;
+        const int sc = (int) scales[p / 16] - 32;
+        const float act = d8 * (float) bq8->qs[l];
+        sum += d * (float) sc * (float) q * act;
+    }
+    return sum;
+}
+
 // Q5_1: llama.cpp's integer chain, but the min term multiplies the sum of the QUANTIZED activations (dp4a with
 // 0x01010101, times d8) instead of the q8_1 block's `ds.y`, which our quantizer (like llama.cpp's) fills with the sum
 // of the ORIGINAL activations.  That is ggml-cpu's convention (its q8_1 `s` is d * sum(q)) and the one the K-quant
@@ -750,6 +782,8 @@ template<> struct Fmt<29> { static constexpr int qk = 256, ipb = 8, step = 1;
     static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_m_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<42> { static constexpr int qk = 64, ipb = 2, step = 1;
     static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q2_0_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<11> { static constexpr int qk = 256, ipb = QI3_K / VDR_Q3_K, step = VDR_Q3_K;
+    static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q3_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<12> { static constexpr int qk = 256, ipb = QI4_K / VDR_Q4_K, step = VDR_Q4_K;
     static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q4_K_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<13> { static constexpr int qk = 256, ipb = QI5_K / VDR_Q5_K, step = VDR_Q5_K;
@@ -770,16 +804,16 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #ifdef STRATA_Q6K_EXPERTS   // opt-in build (-DSTRATA_Q6K_EXPERTS=ON): one more instance per kernel, loaded at start
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(11) X(12) X(13) X(14) X(6) X(2) X(3) X(8)
 #else
-#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8)
+#define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(11) X(12) X(13) X(6) X(2) X(3) X(8)
 #endif
 // Q5_K / Q6_K downs: Qwen3.6-35B-A3B (FF 512, whole 256-blocks per row); Flash-Next's FF 640 never selects them.
 // SYCL port: upstream also lists X(40) (NVFP4) in every list; the port has no NVFP4 kernels, so it stays out.
 #ifdef STRATA_Q6K_EXPERTS
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(14)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(11) X(13) X(14)
 #else
-#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8)
+#define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(11)
 #endif
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8)
 

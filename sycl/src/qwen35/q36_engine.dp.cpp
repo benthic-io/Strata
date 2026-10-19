@@ -18,6 +18,7 @@
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
+#include "strata/sycl_queue.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/fused_gdn.hpp"
@@ -5898,16 +5899,16 @@ bool place_experts(Model &m, Engine &E, double vram_gib, int threads,
     migrated code and was removed or replaced with 0. You may need to check the
     migrated code.
     */
-    bool pinned = DPCT_CHECK_ERROR(
-                      arena = (uint8_t *)sycl::malloc_host(host, q_ct1)) == 0;
+    // SYCL port: cudaHostAlloc answered with an error code; SYCL's malloc_host answers with a null pointer (the
+    // Level Zero driver refuses a pinned allocation of this size without setting one), so `pinned` was true with
+    // nothing to pin into, and the first expert's memset segfaulted.  A refused allocation is exactly what the
+    // pageable fallback below is for.
+    arena = (uint8_t *)strata::malloc_host_guarded(host, q_ct1);
+    const bool pinned = arena != nullptr;
     if (!pinned) {
-        /*
-        DPCT1010:168: SYCL uses exceptions to report errors and does not use the
-        error codes. The cudaGetLastError function call was replaced with 0. You
-        need to rewrite this code.
-        */
-        (void)0;
         arena = (uint8_t*) std::malloc(host);
+        std::fprintf(stderr, "strata-q36: the experts' host arena (%.1f MiB) is pageable, not pinned: the driver would "
+                             "not pin an allocation that size\n", (double) host / 1048576.0);
         if (!arena) {
             err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
             return false;

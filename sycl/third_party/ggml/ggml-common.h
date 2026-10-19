@@ -129,8 +129,8 @@ typedef sycl::half2 ggml_half2;
 #define QI2_K (QK_K / (4*QR2_K))
 #define QR2_K 4
 
-#define QI3_K (QK_K / (4*QR3_K))
-#define QR3_K 4
+#define QI3_K 8
+#define QR3_K 8
 
 #define QI4_K (QK_K / (4*QR4_K))
 #define QR4_K 2
