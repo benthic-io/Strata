@@ -259,7 +259,11 @@ auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NC][32]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const int warp = item_ct1.get_local_id(2) >> 5,
               lane = item_ct1.get_local_id(2) & 31;
-    const int row = item_ct1.get_group(2) * 32 + warp;
+    // SYCL port: one row per warp, so a block covers as many rows as it has warps.  The 32 here was the
+    // 1024-thread block's warp count; a consumer GPU's 512-thread block has 16 and the grid is sized for that
+    // (see the launch), so the row index has to come from the block's own width or half the rows are never written.
+    const int row =
+        item_ct1.get_group(2) * (item_ct1.get_local_range(2) >> 5) + warp;
     float rg[NC], ru[NC];
     q8_row_dot<NC, NJ, PK>(wg, dg, x, row, nb, lane, rg);
     q8_row_dot<NC, NJ, PK>(wu, du, x, row, nb, lane, ru);

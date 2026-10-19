@@ -1473,7 +1473,7 @@ float *upload_f32(const strata::TensorInfo &t, const uint8_t *src) try {
     is not pageable, call wait() on event return by memcpy API to ensure
     synchronization behavior.
     */
-    CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d, h.data(), h.size() * 4)));
+    CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d, h.data(), h.size() * 4).wait()));   // SYCL port: dpct migrated the sync cudaMemcpy to async; without wait() the weights are read before they arrive
     return d;
 }
 catch (sycl::exception const &exc) {
@@ -3101,6 +3101,7 @@ work-group size if needed.
                             });
                 }
             }
+            (void)0;
             if (rows_mode) {   // batch rows: a slot's rows (one, or a verify window's two) in sequence on its own state
                 {
                     auto exp_props =
@@ -3576,6 +3577,7 @@ work-group size if needed.
                     }
                 }
             }
+            (void)0;
             mm(L.wo, att, y, T);
         }
         add_rms_post(L, T);
