@@ -242,9 +242,18 @@ for long context.
 
 ### Speculative decoding is not usable yet
 
-The MTP block loads and runs (Q3_K experts, `vec_dot_q3_K_q8_1`), but its drafts are rejected
-100% of the time and the chained drafts after the first come back as the no-token sentinel.  The
-first draft is a plausible token id and then the block's own output is garbage, so the bug is in
-the MTP block's forward (its attention or its seed/row handling), not in the expert kernel: a
-direct test of `native_mmvq` on a real `blk.40.ffn_gate_exps.weight` row against a dequantized
-reference agrees to 1.6e-7.  Until that is fixed, run without `--mtp`.
+The MTP block now loads and runs (its Q3_K experts go through the new `vec_dot_q3_K_q8_1`), but
+its drafts are still rejected: 0 of 20 on a 12-token prompt and 0 of 124 on a short one, with
+`--mtp 2` and `--mtp 4` alike.  What is ruled out:
+
+- the expert kernel: `native_mmvq` on a real `blk.40.ffn_gate_exps.weight` row agrees with a
+  dequantized reference to 1.6e-7, and the main model's own layers (Q4_K / Q5_K) are unaffected;
+- the head and the argmax: the MTP's `pick_m` equals a host-side argmax of its `logits_m`;
+- the MTP block's forward producing garbage: its `hmtp` is finite with sane magnitudes on every
+  shape measured (T=1, 9, 12, 256).
+
+What is left is whether the MTP block's *attention* over its own K/V is right, and the chained
+drafts: after the first call the later drafts come back as the no-token sentinel, which means the
+chained `forward_mtp(1, ...)` is being fed a seed it cannot use.  Until that is settled, run
+without `--mtp`: the plain greedy text is unchanged and the decode rate is the same (the MTP
+currently costs about 4x, so nothing is lost by leaving it off).
