@@ -18,7 +18,6 @@
 // [--force IDS] [--dump-full-logits F] (tools/qwen35/kl.py's reference interface), --bench-pp N / --bench-tg N.
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
-#include "strata/sycl_queue.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/family_layout.hpp"
 #include "strata/kernels/fused_gdn.hpp"
@@ -72,7 +71,7 @@ namespace MMQ = strata::prefill::mmq;
 bool drop_mtp_block = false;
 
 /*
-DPCT1009:85: SYCL reports errors using exceptions and does not use error codes.
+DPCT1009:87: SYCL reports errors using exceptions and does not use error codes.
 Please replace the "get_error_string_dummy(...)" with a real error-handling
 function.
 */
@@ -87,6 +86,9 @@ double ms_since(Clock::time_point t) { return std::chrono::duration<double, std:
 
 constexpr int kThreads = 256;
 constexpr int kChunkCells = 256;   // attention split-K chunk
+/// --kv-q8: values per FP16 scale in the int8 K / V cache, the group of the main engine's
+/// include/strata/kernels/kv_q8.hpp (kKvInt8) so the two engines store a cell the same way.
+constexpr int KV_Q8_GROUP = 64;
 constexpr int kConvTile = 16;     // tokens per block of the prompt conv (k_conv_seq tile mode)
 
 // ------------------------------------------------------------------------------------------------ small kernels
@@ -104,7 +106,7 @@ inline float block_sum(float v, float *sh) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     sh[item_ct1.get_local_id(2)] = v;
     /*
-    DPCT1065:62: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:63: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -118,7 +120,7 @@ inline float block_sum(float v, float *sh) {
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:64: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:65: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -126,7 +128,7 @@ inline float block_sum(float v, float *sh) {
     }
     const float r = sh[0];
     /*
-    DPCT1065:63: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:64: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -137,7 +139,7 @@ inline float block_max(float v, float *sh) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     sh[item_ct1.get_local_id(2)] = v;
     /*
-    DPCT1065:65: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:66: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -152,7 +154,7 @@ inline float block_max(float v, float *sh) {
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:67: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:68: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -160,7 +162,7 @@ inline float block_max(float v, float *sh) {
     }
     const float r = sh[0];
     /*
-    DPCT1065:66: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:67: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -253,7 +255,7 @@ auto &sh =
                                   : t * K_ + item_ct1.get_local_id(2)) *
                         n;
     /*
-    DPCT1065:68: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:69: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -389,8 +391,10 @@ struct RowSel {
     const int32_t* cell = nullptr;   // device [T]
     const int32_t* slot = nullptr;   // device [T]
     const int32_t* delta = nullptr;  // device [T]
-    float* const* kc = nullptr;      // device [n_sessions]: this layer's K / V base of each session
-    float* const* vc = nullptr;
+    void* const* kc = nullptr;       // device [n_sessions]: this layer's K / V base of each session
+    void* const* vc = nullptr;
+    uint16_t* const* ksc = nullptr;   // q8 only: the FP16 scale of each KV_Q8_GROUP dims, per session (written)
+    uint16_t* const* vsc = nullptr;
 };
 
 /// The attention layer's per-token preparation for T rows at positions *pos0 + t: q (from the [q | gate] pairs) and k
@@ -399,13 +403,15 @@ struct RowSel {
 /// of their cells, see mrope), or, with `mtab` (a request's prompt cells, device int32 [cell][3] = t, h, w), the
 /// interleaved M-RoPE position (llama.cpp's IMROPE with sections 11 / 11 / 10: pair p takes stream p % 3).
 /// grid (H + HKV, T), block 256 (HD <= 256).
-__dpct_inline__ void k_attn_prep(const float *qg, const float *kx,
-                                 const float *vx, const float *qw,
-                                 const float *kw, float *q, float *gate,
-                                 float *kc, float *vc, int H, int HKV, int HD,
-                                 int n_rot, const int32_t *pos0, int ctx,
-                                 float base, float eps, const int32_t *rdelta,
-                                 const int32_t *mtab, RowSel rs) {
+/// Q8 stores the cell as int8 codes with one FP16 scale per 64 dims - the same scheme, and the same
+/// scale = fp16(max|x| / 127) / code = clamp(rint(x / scale), -127, 127), as the main engine's kv_q8.hpp.
+template <bool Q8>
+__dpct_inline__ void
+k_attn_prep(const float *qg, const float *kx, const float *vx, const float *qw,
+            const float *kw, float *q, float *gate, void *kc, void *vc,
+            uint16_t *ksc, uint16_t *vsc, int H, int HKV, int HD, int n_rot,
+            const int32_t *pos0, int ctx, float base, float eps,
+            const int32_t *rdelta, const int32_t *mtab, RowSel rs) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
 auto &sh =
     *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kThreads]>(
@@ -419,6 +425,10 @@ auto &sh =
     if (rs.kc) {
         kc = rs.kc[rs.slot[t]];
         vc = rs.vc[rs.slot[t]];
+        if (rs.ksc) {
+            ksc = rs.ksc[rs.slot[t]];
+            vsc = rs.vsc[rs.slot[t]];
+        }
     }
     const bool isq = head < H;
     const float* src = isq ? qg + ((size_t) t * H + head) * 2 * HD : kx + ((size_t) t * HKV + head - H) * HD;
@@ -428,13 +438,12 @@ auto &sh =
     const float r = sycl::rsqrt(s / (float)HD + eps);
     if (i < HD) buf[i] = v0 * r * (isq ? qw[i] : kw[i]);
     /*
-    DPCT1065:69: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:72: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
     item_ct1.barrier();
-    if (i >= HD) return;
-    float v = buf[i];
+    float v = i < HD ? buf[i] : 0.f;
     const int half = n_rot / 2;
     if (i < n_rot) {
         const int p = i < half ? i : i - half;
@@ -457,25 +466,82 @@ auto &sh =
         v = i < half ? buf[i] * cs - buf[i + half] * sn : buf[i - half] * sn + buf[i] * cs;
     }
     if (isq) {
-        q[((size_t) t * H + head) * HD + i] = v;
-        gate[((size_t) t * H + head) * HD + i] = qg[((size_t) t * H + head) * 2 * HD + HD + i];
-    } else {
-        const int kh = head - H;
-        kc[((size_t) kh * ctx + pos) * HD + i] = v;
-        vc[((size_t) kh * ctx + pos) * HD + i] = vx[((size_t) t * HKV + kh) * HD + i];
+        if (i < HD) {
+            q[((size_t) t * H + head) * HD + i] = v;
+            gate[((size_t) t * H + head) * HD + i] = qg[((size_t) t * H + head) * 2 * HD + HD + i];
+        }
+        return;
+    }
+    const int kh = head - H;
+    if (!Q8) {
+        if (i < HD) {
+            ((sycl::half *)kc)[((size_t)kh * ctx + pos) * HD + i] =
+                sycl::vec<float, 1>(v)
+                    .convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+            ((sycl::half *)vc)[((size_t)kh * ctx + pos) * HD + i] =
+                sycl::vec<float, 1>(vx[((size_t)t * HKV + kh) * HD + i])
+                    .convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+        }
+        return;
+    }
+    // each thread writes its own dim and its group's max over the 64 dims of that group; the block's dim reads of buf
+    // below need every thread alive, so the early return for i >= HD stays out of this path
+    if (i < HD) buf[i] = v;   // post-RoPE k
+    /*
+    DPCT1065:73: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    if (i < HD) {
+        const int g = i / KV_Q8_GROUP;
+        const float* vsrc = vx + (size_t) t * HKV * HD + (size_t) kh * HD;
+        float km = 0.f, vm = 0.f;
+#pragma unroll
+        for (int j2 = 0; j2 < KV_Q8_GROUP; ++j2) {
+            km = sycl::fmax(km, sycl::fabs(buf[g * KV_Q8_GROUP + j2]));
+            vm = sycl::fmax(vm, sycl::fabs(vsrc[g * KV_Q8_GROUP + j2]));
+        }
+        const float kd = km > 0.f ? km / 127.f : 1.f, vd = vm > 0.f ? vm / 127.f : 1.f;
+        int8_t* kp = (int8_t*) kc + ((size_t) kh * ctx + pos) * HD;
+        int8_t* vp = (int8_t*) vc + ((size_t) kh * ctx + pos) * HD;
+        kp[i] =
+            (int8_t)sycl::fmax(-127.f, sycl::fmin(127.f, sycl::rint(v / kd)));
+        vp[i] = (int8_t)sycl::fmax(-127.f,
+                                   sycl::fmin(127.f, sycl::rint(vsrc[i] / vd)));
+        if (i % KV_Q8_GROUP == 0) {
+            ksc[((size_t)kh * ctx + pos) * (HD / KV_Q8_GROUP) + g] =
+                sycl::bit_cast<unsigned short, sycl::half>(
+                    sycl::vec<float, 1>(kd)
+                        .convert<sycl::half,
+                                 sycl::rounding_mode::automatic>()[0]);
+            vsc[((size_t)kh * ctx + pos) * (HD / KV_Q8_GROUP) + g] =
+                sycl::bit_cast<unsigned short, sycl::half>(
+                    sycl::vec<float, 1>(vd)
+                        .convert<sycl::half,
+                                 sycl::rounding_mode::automatic>()[0]);
+        }
     }
 }
 
 /// Split-K attention, one block per (chunk of 256 cells, query row): query row qi = t * H + h (t from t0) sees the
 /// cells [0, *pos0 + t].  Writes the chunk's partial accumulator, max and sum; chunks past the query's cells write
 /// nothing (the merge stops before them).  grid (n_chunk, n_rows), block 256, HD == 256.
-__dpct_inline__ void k_attn_part(const float *q, const float *kc,
-                                 const float *vc, const int32_t *pos0, int t0,
-                                 int H, int HKV, int ctx, float scale,
-                                 int n_chunk, float *pacc, float *pm, float *pl,
-                                 RowSel rs) {
+template <bool Q8>
+/*
+DPCT1110:22: The total declared local variable size in device function
+k_attn_part exceeds 128 bytes and may cause high register pressure. Consult with
+your hardware vendor to find the total register size available and adjust the
+code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void k_attn_part(const float *q, const void *kc, const void *vc,
+                                 const uint16_t *ksc, const uint16_t *vsc,
+                                 const int32_t *pos0, int t0, int H, int HKV,
+                                 int ctx, float scale, int n_chunk, float *pacc,
+                                 float *pm, float *pl, RowSel rs) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     constexpr int HD = 256;
+    constexpr int G = HD / KV_Q8_GROUP;   // q8 groups per row
     auto &qs = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[HD]>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     auto &sc = *sycl::ext::oneapi::group_local_memory_for_overwrite<
@@ -490,13 +556,17 @@ __dpct_inline__ void k_attn_part(const float *q, const float *kc,
     if (rs.kc) {
         kc = rs.kc[rs.slot[t]];
         vc = rs.vc[rs.slot[t]];
+        if (rs.ksc) {
+            ksc = rs.ksc[rs.slot[t]];
+            vsc = rs.vsc[rs.slot[t]];
+        }
     }
     const int p0 = c * kChunkCells;
     if (p0 >= npos) return;
     const int j = item_ct1.get_local_id(2);
     qs[j] = q[((size_t) t * H + h) * HD + j];
     /*
-    DPCT1065:72: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:74: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -504,10 +574,29 @@ __dpct_inline__ void k_attn_part(const float *q, const float *kc,
     const int p = p0 + j;
     float s = -INFINITY;
     if (p < npos) {
-        const float* kp = kc + ((size_t) kvh * ctx + p) * HD;
         float a = 0.f;
+        if (Q8) {
+            const int8_t* kp = (const int8_t*) kc + ((size_t) kvh * ctx + p) * HD;
+            const uint16_t* ks = ksc + ((size_t) kvh * ctx + p) * G;
+            for (int g = 0; g < G; ++g) {
+                const float ds =
+                    sycl::vec<sycl::half, 1>(
+                        sycl::bit_cast<sycl::half, unsigned short>(ks[g]))
+                        .convert<float, sycl::rounding_mode::automatic>()[0];
 #pragma unroll
-        for (int i = 0; i < HD; ++i) a += qs[i] * kp[i];
+                for (int i = 0; i < KV_Q8_GROUP; ++i) a +=
+                    qs[g * KV_Q8_GROUP + i] * ds *
+                    (float)kp[g * KV_Q8_GROUP + i];
+            }
+        } else {
+            const sycl::half *kp =
+                (const sycl::half *)kc + ((size_t)kvh * ctx + p) * HD;
+#pragma unroll
+            for (int i = 0; i < HD; ++i) a +=
+                qs[i] *
+                sycl::vec<sycl::half, 1>(kp[i])
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+        }
         s = a * scale;
     }
     const float m = block_max(s, sh);
@@ -516,9 +605,26 @@ __dpct_inline__ void k_attn_part(const float *q, const float *kc,
     const float l = block_sum(e, sh);
     const int n = sycl::min(kChunkCells, npos - p0);
     float acc = 0.f;
-    const float* vp = vc + ((size_t) kvh * ctx + p0) * HD + j;
+    if (Q8) {
+        const int g = j / KV_Q8_GROUP;
+        const int8_t* vp = (const int8_t*) vc + ((size_t) kvh * ctx + p0) * HD + j;
+        const uint16_t* vs = vsc + ((size_t) kvh * ctx + p0) * G + g;
 #pragma unroll
-    for (int k = 0; k < n; ++k) acc += sc[k] * vp[(size_t)k * HD];
+        for (int k = 0; k < n; ++k)
+            acc += sc[k] *
+                   sycl::vec<sycl::half, 1>(
+                       sycl::bit_cast<sycl::half, unsigned short>(
+                           vs[(size_t)k * G]))
+                       .convert<float, sycl::rounding_mode::automatic>()[0] *
+                   (float)vp[(size_t)k * HD];
+    } else {
+        const sycl::half *vp =
+            (const sycl::half *)vc + ((size_t)kvh * ctx + p0) * HD + j;
+#pragma unroll
+        for (int k = 0; k < n; ++k) acc +=
+            sc[k] * sycl::vec<sycl::half, 1>(vp[(size_t)k * HD])
+                        .convert<float, sycl::rounding_mode::automatic>()[0];
+    }
     const size_t o = (size_t) row * n_chunk + c;
     pacc[o * HD + j] = acc;
     if (j == 0) {
@@ -653,9 +759,14 @@ __dpct_inline__ void k_merge_cpu(float *parts, const float *cpu,
 }
 /// The prompt attention's FP16 operands: cells [0, P) of each KV head's K / V (cache rows ctx apart) into compact
 /// [kvh][P][HD] halves.  grid1(HKV * P * HD).
-__dpct_inline__ void k_kv_f16(const float *kc, const float *vc, sycl::half *k16,
-                              sycl::half *v16, int ctx, int P, int HD,
-                              int HKV) {
+/// The prompt attention's FP16 operands: cells [0, P) of each KV head's K / V (cache rows ctx apart) into compact
+/// [kvh][P][HD] halves.  The cache is FP16 already, so this only compacts the strided rows; under Q8 it also
+/// dequantizes (each code times its group's FP16 scale).  grid1(HKV * P * HD).
+template <bool Q8>
+__dpct_inline__ void k_kv_f16(const void *kc, const void *vc,
+                              const uint16_t *ksc, const uint16_t *vsc,
+                              sycl::half *k16, sycl::half *v16, int ctx, int P,
+                              int HD, int HKV) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i =
         (int64_t)item_ct1.get_group(2) * item_ct1.get_local_range(2) +
@@ -664,10 +775,24 @@ __dpct_inline__ void k_kv_f16(const float *kc, const float *vc, sycl::half *k16,
     const int64_t per = (int64_t) P * HD;
     const int64_t kvh = i / per, rest = i % per;
     const size_t src = (size_t) kvh * ctx * HD + rest;
-    k16[i] = sycl::vec<float, 1>(kc[src])
-                 .convert<sycl::half, sycl::rounding_mode::automatic>()[0];
-    v16[i] = sycl::vec<float, 1>(vc[src])
-                 .convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+    if (Q8) {
+        // one scale per 64 dims, laid out interleaved with the codes, so a code's scale is its own index / 64
+        const float kd =
+            sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(
+                                         ksc[src / KV_Q8_GROUP]))
+                .convert<float, sycl::rounding_mode::automatic>()[0];
+        const float vd =
+            sycl::vec<sycl::half, 1>(sycl::bit_cast<sycl::half, unsigned short>(
+                                         vsc[src / KV_Q8_GROUP]))
+                .convert<float, sycl::rounding_mode::automatic>()[0];
+        k16[i] = sycl::vec<float, 1>(kd * (float)((const int8_t *)kc)[src])
+                     .convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+        v16[i] = sycl::vec<float, 1>(vd * (float)((const int8_t *)vc)[src])
+                     .convert<sycl::half, sycl::rounding_mode::automatic>()[0];
+    } else {
+        k16[i] = ((const sycl::half *)kc)[src];
+        v16[i] = ((const sycl::half *)vc)[src];
+    }
 }
 /// The prompt's causal softmax: row (h, t) of S (ld floats, P cells) -> softmax(S * scale) over the cells
 /// [0, pos0 + t], 0 past them, as FP16 probabilities (S16, the same row offsets, ld halves).  grid (T, H), block 256.
@@ -800,7 +925,7 @@ auto &bv =
     bv[item_ct1.get_local_id(2)] = v;
     bi[item_ct1.get_local_id(2)] = id;
     /*
-    DPCT1065:73: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:75: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -817,11 +942,11 @@ auto &bv =
             }
         }
         /*
-        DPCT1118:22: SYCL group functions and algorithms must be encountered in
+        DPCT1118:23: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:74: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:76: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -845,7 +970,7 @@ unsigned grid1(int64_t n, int b = kThreads) { return (unsigned) ((n + b - 1) / b
 /// picked 8 x 8 / 16 x 16 tiles for these shapes (~10% of a prompt).  K % 4 == 0.
 template <int TM>
 /*
-DPCT1110:23: The total declared local variable size in device function
+DPCT1110:24: The total declared local variable size in device function
 k_sgemm_nt exceeds 128 bytes and may cause high register pressure. Consult with
 your hardware vendor to find the total register size available and adjust the
 code, or use smaller sub-group size to avoid high register pressure.
@@ -886,7 +1011,7 @@ k_sgemm_nt(const float *__restrict__ W, const float *__restrict__ x,
         Bs[lk][lr] = b.x(); Bs[lk + 1][lr] = b.y(); Bs[lk + 2][lr] = b.z();
             Bs[lk + 3][lr] = b.w();
         /*
-        DPCT1118:24: SYCL group functions and algorithms must be encountered in
+        DPCT1118:25: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         item_ct1.barrier(sycl::access::fence_space::local_space);
@@ -905,7 +1030,7 @@ k_sgemm_nt(const float *__restrict__ W, const float *__restrict__ x,
                     acc[i][j] = sycl::fma(ar[i], (float)(br[j]), acc[i][j]);
         }
         /*
-        DPCT1118:25: SYCL group functions and algorithms must be encountered in
+        DPCT1118:26: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         item_ct1.barrier(sycl::access::fence_space::local_space);
@@ -999,7 +1124,7 @@ auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[4]>(
         if (qk) {
             float sq = y * y;
             /*
-DPCT1108:28: '__shfl_xor_sync' was migrated with the experimental feature masked
+DPCT1108:29: '__shfl_xor_sync' was migrated with the experimental feature masked
 sub_group function which may not be supported by all compilers or runtimes. You
 may need to adjust the code.
 */
@@ -1011,22 +1136,22 @@ may need to adjust the code.
             if ((item_ct1.get_local_id(2) & 31) == 0)
                 part[item_ct1.get_local_id(2) >> 5] = sq;
             /*
-            DPCT1118:26: SYCL group functions and algorithms must be encountered
+            DPCT1118:27: SYCL group functions and algorithms must be encountered
             in converged control flow. You may need to adjust the code.
             */
             /*
-            DPCT1065:75: Consider replacing sycl::nd_item::barrier() with
+            DPCT1065:77: Consider replacing sycl::nd_item::barrier() with
             sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
             better performance if there is no access to global memory.
             */
             item_ct1.barrier();
             const float ss = part[0] + part[1] + part[2] + part[3];
             /*
-            DPCT1118:27: SYCL group functions and algorithms must be encountered
+            DPCT1118:28: SYCL group functions and algorithms must be encountered
             in converged control flow. You may need to adjust the code.
             */
             /*
-            DPCT1065:76: Consider replacing sycl::nd_item::barrier() with
+            DPCT1065:78: Consider replacing sycl::nd_item::barrier() with
             sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
             better performance if there is no access to global memory.
             */
@@ -1045,7 +1170,7 @@ may need to adjust the code.
 /// (block = one V head, 128 columns x 4 row groups, state [row][head][col]) with its 32 state rows per thread kept in
 /// registers across the tokens.  h (T, C) = q | k | v, gate / beta (T, HV), z / y (T, ZV).
 /*
-DPCT1110:29: The total declared local variable size in device function k_gdn_seq
+DPCT1110:30: The total declared local variable size in device function k_gdn_seq
 exceeds 128 bytes and may cause high register pressure. Consult with your
 hardware vendor to find the total register size available and adjust the code,
 or use smaller sub-group size to avoid high register pressure.
@@ -1094,11 +1219,11 @@ k_gdn_seq(float *state, const float *h, int C, const float *gate,
         const float* ht = h + (size_t) t * C;
         if (tid < S) { sk[tid] = ht[h_k * S + qh * S + tid]; sq[tid] = ht[qh * S + tid]; }
         /*
-        DPCT1118:30: SYCL group functions and algorithms must be encountered in
+        DPCT1118:31: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:77: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:79: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -1110,11 +1235,11 @@ k_gdn_seq(float *state, const float *h, int C, const float *gate,
             kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
         red_kv[rg][col] = kv;
         /*
-        DPCT1118:31: SYCL group functions and algorithms must be encountered in
+        DPCT1118:32: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:78: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:80: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -1129,11 +1254,11 @@ k_gdn_seq(float *state, const float *h, int C, const float *gate,
         }
         red_o[rg][col] = o;
         /*
-        DPCT1118:32: SYCL group functions and algorithms must be encountered in
+        DPCT1118:33: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:79: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:81: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -1146,7 +1271,7 @@ k_gdn_seq(float *state, const float *h, int C, const float *gate,
             sq_part = oc * oc;
         }
         /*
-DPCT1108:35: '__shfl_xor_sync' was migrated with the experimental feature masked
+DPCT1108:36: '__shfl_xor_sync' was migrated with the experimental feature masked
 sub_group function which may not be supported by all compilers or runtimes. You
 may need to adjust the code.
 */
@@ -1157,11 +1282,11 @@ may need to adjust the code.
                 sq_part, o2);
         if ((tid & 31) == 0) wsum[tid >> 5] = sq_part;
         /*
-        DPCT1118:33: SYCL group functions and algorithms must be encountered in
+        DPCT1118:34: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:80: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:82: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -1175,11 +1300,11 @@ may need to adjust the code.
                 (zz / (1.0f + sycl::native::exp(-zz)));
         }
         /*
-        DPCT1118:34: SYCL group functions and algorithms must be encountered in
+        DPCT1118:35: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:81: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:83: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -1197,7 +1322,7 @@ may need to adjust the code.
 /// o (T, HV * 128); k_gdn_norm applies the SiLU-gated RMS norm.  grid (HV, kGdnColGroups), block (32, 16).
 constexpr int kGdnColGroups = 4;
 /*
-DPCT1110:36: The total declared local variable size in device function
+DPCT1110:37: The total declared local variable size in device function
 k_gdn_seq_cols exceeds 128 bytes and may cause high register pressure. Consult
 with your hardware vendor to find the total register size available and adjust
 the code, or use smaller sub-group size to avoid high register pressure.
@@ -1246,11 +1371,11 @@ __dpct_inline__ void k_gdn_seq_cols(float *state, const float *h, int C,
         const float vcur = nvv, gcur = ngate, bcur = nbeta;
         if (t + 1 < T) load(t + 1);
         /*
-        DPCT1118:37: SYCL group functions and algorithms must be encountered in
+        DPCT1118:38: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:83: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:85: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -1269,11 +1394,11 @@ __dpct_inline__ void k_gdn_seq_cols(float *state, const float *h, int C,
             kv = sycl::fma(sv[r], sk[par][rg * RPG + r], kv);
         red_kv[rg][cl] = kv;
         /*
-        DPCT1118:38: SYCL group functions and algorithms must be encountered in
+        DPCT1118:39: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:84: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:86: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -1291,7 +1416,7 @@ __dpct_inline__ void k_gdn_seq_cols(float *state, const float *h, int C,
         red_o[rg][cl] = o;
     }
     /*
-    DPCT1065:82: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:84: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -1319,7 +1444,7 @@ auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[4]>(
     const float oc = o_raw[i];
     float sq = oc * oc;
     /*
-DPCT1108:39: '__shfl_xor_sync' was migrated with the experimental feature masked
+DPCT1108:40: '__shfl_xor_sync' was migrated with the experimental feature masked
 sub_group function which may not be supported by all compilers or runtimes. You
 may need to adjust the code.
 */
@@ -1468,12 +1593,12 @@ float *upload_f32(const strata::TensorInfo &t, const uint8_t *src) try {
     float* d = nullptr;
     CK(DPCT_CHECK_ERROR(d = (float *)sycl::malloc_device(h.size() * 4, q_ct1)));
     /*
-    DPCT1114:86: cudaMemcpy is migrated to asynchronization memcpy, assuming in
+    DPCT1114:88: cudaMemcpy is migrated to asynchronization memcpy, assuming in
     the original code the source host memory is pageable memory. If the memory
     is not pageable, call wait() on event return by memcpy API to ensure
     synchronization behavior.
     */
-    CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d, h.data(), h.size() * 4).wait()));   // SYCL port: dpct migrated the sync cudaMemcpy to async; without wait() the weights are read before they arrive
+    CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d, h.data(), h.size() * 4).wait()));   // SYCL port: dpct migrated sync cudaMemcpy to async
     return d;
 }
 catch (sycl::exception const &exc) {
@@ -1536,7 +1661,7 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
         uint8_t* d = nullptr;
         CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::malloc_device(nb, q_ct1)));
         /*
-        DPCT1114:87: cudaMemcpy is migrated to asynchronization memcpy, assuming
+        DPCT1114:89: cudaMemcpy is migrated to asynchronization memcpy, assuming
         in the original code the source host memory is pageable memory. If the
         memory is not pageable, call wait() on event return by memcpy API to
         ensure synchronization behavior.
@@ -1565,17 +1690,12 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
     // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp
     (void) want_mtp;
     m.has_mtp = g.n_mtp_layers > 0;
-    // SYCL port: --no-mtp-block runs the model without the file's MTP block.  A GGUF quantizer may give that block
-    // its own expert type (Unsloth's UD-Q4_K_XL for Qwen3.6-35B-A3B, and Cyber-Tiel with it, quantizes that block
-    // Q3_K), and a type no grouped-expert kernel takes would refuse the whole file for a layer that only ever
-    // produces speculative drafts.  Dropping it costs the draft head (decode is slower) and changes nothing else:
-    // the main blocks, the head and the tokenizer are untouched.  Opt-in: without the flag the file is refused
-    // exactly as before.
+    // SYCL port: --no-mtp-block runs the model without the file's MTP block.
     if (m.has_mtp && drop_mtp_block) {
         std::fprintf(stderr, "strata-q36: --no-mtp-block: the file's MTP block (blk.%lld) is not loaded and nothing "
                              "drafts with it; the answers are the same, decode is slower\n",
                      (long long) g.n_layers);
-        m.g.n_mtp_layers = 0;   // `g` below is a const alias of m.g
+        m.g.n_mtp_layers = 0;
         m.has_mtp = false;
     }
     for (int64_t l = 0; l < g.n_layers + (m.has_mtp ? 1 : 0); ++l) {
@@ -1659,7 +1779,7 @@ bool load(const std::string &path, Model &m, std::string &err, bool want_mtp) {
         uint8_t* d = nullptr;
         CK(DPCT_CHECK_ERROR(d = (uint8_t *)sycl::malloc_device(nb, q_ct1)));
         /*
-        DPCT1114:88: cudaMemcpy is migrated to asynchronization memcpy, assuming
+        DPCT1114:90: cudaMemcpy is migrated to asynchronization memcpy, assuming
         in the original code the source host memory is pageable memory. If the
         memory is not pageable, call wait() on event return by memcpy API to
         ensure synchronization behavior.
@@ -1733,7 +1853,13 @@ struct Engine {
     float *pacc, *pm, *pl, *amv;
     int32_t* ami;
     int n_chunk = 0, att_rows = 0;   // attention partials: att_rows query rows x n_chunk chunks
-    std::vector<float*> conv, S, kc, vc;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
+    std::vector<float*> conv, S;   // per layer; the MTP block's K / V at index n_layers: the CURRENT session's (select)
+    // The K / V cache: FP16, or int8 codes + an FP16 scale per KV_Q8_GROUP dims under --kv-q8.  FP16 rather than
+    // FP32 because the prompt path has always attended over halves (k_kv_f16 staged the FP32 cells through
+    // __half before the GEMMs), so the FP32 cache only ever gave the split-K decode a higher precision than the
+    // prefill it was sharing a sequence with.  At 262144 cells the difference is 12.9 GiB against 6.4.
+    std::vector<void*> kc, vc;
+    std::vector<uint16_t*> ksc, vsc;   // q8 scales [kvh][ctx][HD / KV_Q8_GROUP]; null on the FP16 path
     // verify windows (T <= kVerify): the GDN inputs of every row per layer, kept for the commit
     static constexpr int kVerify = 8;
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
@@ -1767,13 +1893,16 @@ struct Engine {
     float *mq_gu = nullptr, *mq_h = nullptr;
     sycl::half *x16 = nullptr;
     bool use_graph = true;
+    bool kv_q8 = false;   // int8 K / V cache with an FP16 scale per KV_Q8_GROUP dims; false is FP16
     int mtp_d = 0;   // MTP drafts per speculative step (0: none; greedy requests only)
 
     // ---- sessions: the conversation states.  One for a single-request engine; --batch N keeps N, each with its own
     // recurrent state and KV cache, so N requests run at once: their rows share one decode window (forward_rows).  The
     // members conv / S / kc / vc / pos / hlast above are the CURRENT session's (select() swaps them).
     struct Sess {
-        std::vector<float*> conv, S, kc, vc;
+        std::vector<float*> conv, S;
+        std::vector<void*> kc, vc;          // FP16 cells, or int8 codes under --kv-q8
+        std::vector<uint16_t*> ksc, vsc;    // q8: the FP16 scale of each 64 dims, [kvh][ctx][HD / 64]; null otherwise
         float* hlast = nullptr;
         int64_t pos = 0;
         int32_t rdelta = 0;                 // rotary offset of the text after the last picture (see k_attn_prep)
@@ -1786,7 +1915,9 @@ struct Engine {
     int n_sess = 1, cur = 0;
     uint64_t use_clock = 0;
     // device tables for batch rows: per state index (layer, then the MTP block) the session pointers
-    float **d_conv_tab = nullptr, **d_S_tab = nullptr, **d_kc_tab = nullptr, **d_vc_tab = nullptr;
+    float **d_conv_tab = nullptr, **d_S_tab = nullptr;
+    void **d_kc_tab = nullptr, **d_vc_tab = nullptr;
+    uint16_t **d_ksc_tab = nullptr, **d_vsc_tab = nullptr;
     int32_t *d_rcell = nullptr, *d_rslot = nullptr, *d_rdelta = nullptr;   // [kVerify] the rows' cell / session / rotary offset
     // the GDN layers run a slot's rows in sequence: per group (a slot) its session, its first row and its row count
     int32_t *d_gslot = nullptr, *d_grow0 = nullptr, *d_gcnt = nullptr;
@@ -1877,24 +2008,43 @@ struct Engine {
     void alloc_session(Sess& ss) const {
         const auto& g = m->g;
         const size_t C = (size_t) g.ssm_conv_channels;
+        // one cache cell per (KV head, position): FP16, or int8 codes + a scale per 64 dims under --kv-q8
+        const size_t nc = (size_t) g.n_head_kv * ctx * g.head_dim;
+        const size_t ns = (size_t) g.n_head_kv * ctx * (g.head_dim / KV_Q8_GROUP);
+        auto cell = [&]() {
+            if (kv_q8) {
+                ss.kc.push_back(dalloc_t<int8_t>(nc));
+                ss.vc.push_back(dalloc_t<int8_t>(nc));
+                ss.ksc.push_back(dalloc_t<uint16_t>(ns));
+                ss.vsc.push_back(dalloc_t<uint16_t>(ns));
+            } else {
+                ss.kc.push_back(dalloc_t<sycl::half>(nc));
+                ss.vc.push_back(dalloc_t<sycl::half>(nc));
+                ss.ksc.push_back(nullptr);
+                ss.vsc.push_back(nullptr);
+            }
+        };
+        auto none = [&]() {
+            ss.kc.push_back(nullptr);
+            ss.vc.push_back(nullptr);
+            ss.ksc.push_back(nullptr);
+            ss.vsc.push_back(nullptr);
+        };
         for (const Layer& L : m->layers) {
             if (L.attn) {
                 ss.conv.push_back(nullptr);
                 ss.S.push_back(nullptr);
-                ss.kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
-                ss.vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+                cell();
             } else {
                 ss.conv.push_back(dalloc(C * (g.ssm_d_conv - 1)));
                 ss.S.push_back(dalloc((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
-                ss.kc.push_back(nullptr);
-                ss.vc.push_back(nullptr);
+                none();
             }
         }
         if (m->has_mtp) {   // the MTP block's own K / V (an attention layer at index n_layers)
             ss.conv.push_back(nullptr);
             ss.S.push_back(nullptr);
-            ss.kc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
-            ss.vc.push_back(dalloc((size_t) g.n_head_kv * ctx * g.head_dim));
+            cell();
         }
         ss.hlast = dalloc((size_t) g.n_embd);
     }
@@ -1908,7 +2058,7 @@ struct Engine {
     }
     void load_cur() {
         Sess& ss = sess[(size_t) cur];
-        conv = ss.conv; S = ss.S; kc = ss.kc; vc = ss.vc;
+        conv = ss.conv; S = ss.S; kc = ss.kc; vc = ss.vc; ksc = ss.ksc; vsc = ss.vsc;
         hlast = ss.hlast;
         pos = ss.pos;
         ss.used = ++use_clock;
@@ -1920,7 +2070,7 @@ struct Engine {
         if (!d_delta) return;
         hpin[60] = d;
         /*
-        DPCT1124:89: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:91: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -1947,7 +2097,7 @@ struct Engine {
         const size_t T = (size_t) tmax, N = (size_t) g.n_embd, Kp = (size_t) m->top_k, FF = (size_t) g.n_ff;
         const size_t C = (size_t) g.ssm_conv_channels;
         /*
-        DPCT1025:90: The SYCL queue is created ignoring the flag and priority
+        DPCT1025:92: The SYCL queue is created ignoring the flag and priority
         options.
         */
         CK(DPCT_CHECK_ERROR(st = dev_ct1.create_queue(true)));
@@ -2078,7 +2228,7 @@ struct Engine {
                                (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4 * n_gdn;
             size_t fr0 = 0, tot0 = 0;
             /*
-            DPCT1106:91: 'cudaMemGetInfo' was migrated with the Intel extensions
+            DPCT1106:93: 'cudaMemGetInfo' was migrated with the Intel extensions
             for device information which may not be supported by all compilers
             or runtimes. You may need to adjust the code.
             */
@@ -2098,16 +2248,19 @@ struct Engine {
         for (Sess& ss : sess) alloc_session(ss);
         if (n_sess > 1) {   // the batch rows' tables: per state index the session pointers, on the device
             const size_t ns = sess[0].conv.size();
-            std::vector<float*> hc(ns * (size_t) n_sess), hs(hc), hk(hc), hv(hc);
+            std::vector<float*> hc(ns * (size_t) n_sess), hs(hc);
+            std::vector<void*> hk(ns * (size_t) n_sess), hv(hk);
+            std::vector<uint16_t*> hks(ns * (size_t) n_sess), hvs(hks);
             for (size_t li = 0; li < ns; ++li)
                 for (int s_ = 0; s_ < n_sess; ++s_) {
                     hc[li * n_sess + s_] = sess[(size_t) s_].conv[li];
                     hs[li * n_sess + s_] = sess[(size_t) s_].S[li];
                     hk[li * n_sess + s_] = sess[(size_t) s_].kc[li];
                     hv[li * n_sess + s_] = sess[(size_t) s_].vc[li];
+                    hks[li * n_sess + s_] = sess[(size_t) s_].ksc[li];   // null for the GDN layers
+                    hvs[li * n_sess + s_] = sess[(size_t) s_].vsc[li];
                 }
-            const std::pair<float***, std::vector<float*>*> tabs[4] = {{&d_conv_tab, &hc}, {&d_S_tab, &hs},
-                                                                          {&d_kc_tab, &hk}, {&d_vc_tab, &hv}};
+            const std::pair<float***, std::vector<float*>*> tabs[2] = {{&d_conv_tab, &hc}, {&d_S_tab, &hs}};
             for (const auto& tb : tabs) {
                 CK(DPCT_CHECK_ERROR(*tb.first = sycl::malloc_device<float *>(
                                         tb.second->size(), q_ct1)));
@@ -2116,6 +2269,32 @@ struct Engine {
                         .memcpy((void *)*tb.first, tb.second->data(),
                                 tb.second->size() * sizeof(float *))
                         .wait()));
+            }
+            for (const auto& tb : {std::pair<void***, std::vector<void*>*>{&d_kc_tab, &hk},
+                                   {&d_vc_tab, &hv}}) {
+                CK(DPCT_CHECK_ERROR(*tb.first = sycl::malloc_device<void *>(
+                                        tb.second->size(), q_ct1)));
+                CK(DPCT_CHECK_ERROR(
+                    q_ct1
+                        .memcpy((void *)*tb.first, tb.second->data(),
+                                tb.second->size() * sizeof(void *))
+                        .wait()));
+            }
+            if (kv_q8) {   // the q8 scale tables ride alongside, empty pointers included (a session without scales)
+                const auto push16 = [](uint16_t ***dst,
+                                       const std::vector<uint16_t *> &h) {
+    dpct::device_ext &dev_ct1 = dpct::get_current_device();
+    sycl::queue &q_ct1 = dev_ct1.in_order_queue();
+                    CK(DPCT_CHECK_ERROR(*dst = sycl::malloc_device<uint16_t *>(
+                                            h.size(), q_ct1)));
+                    CK(DPCT_CHECK_ERROR(
+                        q_ct1
+                            .memcpy((void *)*dst, h.data(),
+                                    h.size() * sizeof(uint16_t *))
+                            .wait()));
+                };
+                push16(&d_ksc_tab, hks);
+                push16(&d_vsc_tab, hvs);
             }
             d_rcell = dalloc_t<int32_t>(kVerify);
             d_rslot = dalloc_t<int32_t>(kVerify);
@@ -2148,7 +2327,7 @@ struct Engine {
                                                // of the buffers above is done
         size_t fr = 0, tot = 0;
         /*
-        DPCT1106:92: 'cudaMemGetInfo' was migrated with the Intel extensions for
+        DPCT1106:94: 'cudaMemGetInfo' was migrated with the Intel extensions for
         device information which may not be supported by all compilers or
         runtimes. You may need to adjust the code.
         */
@@ -2197,7 +2376,7 @@ struct Engine {
                     sycl::ext::oneapi::experimental::use_root_sync};
 
                 ((sycl::queue *)(st))
-                    ->parallel_for<dpct_kernel_name<class k_gemv_f32_954551>>(
+                    ->parallel_for<dpct_kernel_name<class k_gemv_f32_d96a3c>>(
                         sycl::nd_range<3>(sycl::range(1, T, rows8(n_out)) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -2224,7 +2403,7 @@ struct Engine {
                     sycl::ext::oneapi::experimental::use_root_sync};
 
                 ((sycl::queue *)(st))
-                    ->parallel_for<dpct_kernel_name<class k_sgemm_nt_f6a480,
+                    ->parallel_for<dpct_kernel_name<class k_sgemm_nt_d6fcb0,
                                                     dpct_kernel_scalar<4>>>(
                         sycl::nd_range<3>(sycl::range(splits, gy, gx) *
                                               sycl::range(1, 1, 256),
@@ -2238,7 +2417,7 @@ struct Engine {
                     sycl::ext::oneapi::experimental::use_root_sync};
 
                 ((sycl::queue *)(st))
-                    ->parallel_for<dpct_kernel_name<class k_sgemm_nt_731896,
+                    ->parallel_for<dpct_kernel_name<class k_sgemm_nt_45bfee,
                                                     dpct_kernel_scalar<1>>>(
                         sycl::nd_range<3>(sycl::range(splits, gy, gx) *
                                               sycl::range(1, 1, 256),
@@ -2258,7 +2437,7 @@ struct Engine {
                     auto int64_t_T_n_out_ct2 = (int64_t)T * n_out;
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class k_sum_splits_725413>>(
+                        dpct_kernel_name<class k_sum_splits_3cfdc1>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, grid1((int64_t)T * n_out)) *
                                 sycl::range(1, 1, kThreads),
@@ -2300,7 +2479,7 @@ struct Engine {
                 auto x16_ct1 = x16;
                 auto int64_t_n_T_ct2 = (int64_t)n * T;
 
-                cgh.parallel_for<dpct_kernel_name<class k_to_f16_6e4da4>>(
+                cgh.parallel_for<dpct_kernel_name<class k_to_f16_deb7d1>>(
                     sycl::nd_range<3>(sycl::range(1, 1, grid1((int64_t)n * T)) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -2461,7 +2640,7 @@ struct Engine {
                                             (size_t)8 * 2048 * 4, q_ct1)));
                 }
                 /*
-                DPCT1124:93: cudaMemcpyAsync is migrated to asynchronous memcpy
+                DPCT1124:95: cudaMemcpyAsync is migrated to asynchronous memcpy
                 API. While the origin API might be synchronous, it depends on
                 the type of operand memory, so you may need to call wait() on
                 event return by memcpy API to ensure synchronization behavior.
@@ -2479,7 +2658,7 @@ struct Engine {
                         auto m_eps_ct5 = m->eps;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_add_rms_a0be95>>(
+                            dpct_kernel_name<class k_add_rms_187b7e>>(
                             sycl::nd_range<3>(sycl::range(1, 1, T) *
                                                   sycl::range(1, 1, kThreads),
                                               sycl::range(1, 1, kThreads)),
@@ -2534,7 +2713,7 @@ struct Engine {
                 auto h_ct3 = h;
                 auto m_eps_ct5 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_add_rms_9ac888>>(
+                cgh.parallel_for<dpct_kernel_name<class k_add_rms_f40e4e>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -2561,8 +2740,6 @@ struct Engine {
             (K::native_q8_0_packed_eligible(a.n_in, a.n_out) && K::native_q8_0_packed_enabled()))
             return false;
         const int nb = a.n_in / 32;
-        // SYCL port: k_sh_gu gives each work-group one row per warp, so the block's width sets how many rows a
-        // launch covers: 512 threads = 16 rows per group (a consumer GPU's max work-group), not 32.
         const dpct::dim3 grid((unsigned)(FS / 16));
         const bool pkd = false;
         const uint8_t* wa = a.d;
@@ -2570,12 +2747,12 @@ struct Engine {
         const sycl::half *da = nullptr;
         const sycl::half *db = nullptr;
 /*
-DPCT1049:40: The work-group size passed to the SYCL kernel may exceed the limit.
+DPCT1049:41: The work-group size passed to the SYCL kernel may exceed the limit.
 To get the device limit, query info::device::max_work_group_size. Adjust the
 work-group size if needed.
 */
 /*
-DPCT1049:41: The work-group size passed to the SYCL kernel may exceed the limit.
+DPCT1049:42: The work-group size passed to the SYCL kernel may exceed the limit.
 To get the device limit, query info::device::max_work_group_size. Adjust the
 work-group size if needed.
 */
@@ -2685,7 +2862,7 @@ work-group size if needed.
                 const int32_t *ids_ct0 = ids;
                 auto m_g_n_expert_ct3 = (int)m->g.n_expert;
 
-                cgh.parallel_for<dpct_kernel_name<class k_group_hy_c0f112>>(
+                cgh.parallel_for<dpct_kernel_name<class k_group_hy_8fb3be>>(
                     sycl::nd_range<3>(sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -2702,7 +2879,7 @@ work-group size if needed.
                 const int32_t *ids_ct0 = ids;
                 auto m_g_n_expert_ct3 = (int)m->g.n_expert;
 
-                cgh.parallel_for<dpct_kernel_name<class k_group_1b8580>>(
+                cgh.parallel_for<dpct_kernel_name<class k_group_196eb2>>(
                     sycl::nd_range<3>(sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -2933,7 +3110,7 @@ work-group size if needed.
                                         (size_t)8 * 2048 * 4, q_ct1)));
             }
             /*
-            DPCT1124:94: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+            DPCT1124:96: cudaMemcpyAsync is migrated to asynchronous memcpy API.
             While the origin API might be synchronous, it depends on the type of
             operand memory, so you may need to call wait() on event return by
             memcpy API to ensure synchronization behavior.
@@ -2950,7 +3127,7 @@ work-group size if needed.
                     auto vh__ct9 = vh_;
                     auto m_eps_ct11 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_moe_out_383253>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_moe_out_aa2e40>>(
                         sycl::nd_range<3>(sycl::range(1, 1, T) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -2965,7 +3142,7 @@ work-group size if needed.
         if (small) {
             const bool mkq = wn != nullptr && hout == h;   // the next layer's input, quantized here
             /*
-            DPCT1049:42: The work-group size passed to the SYCL kernel may
+            DPCT1049:43: The work-group size passed to the SYCL kernel may
             exceed the limit. To get the device limit, query
             info::device::max_work_group_size. Adjust the work-group size if
             needed.
@@ -3018,7 +3195,7 @@ work-group size if needed.
                 const float *ewts_ct3 = ewts;
                 auto m_eps_ct11 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_moe_out_c0eed9>>(
+                cgh.parallel_for<dpct_kernel_name<class k_moe_out_f03a29>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3071,7 +3248,7 @@ work-group size if needed.
                 ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
                     const float *h_ct2 = h;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_gdn_ab_232e45>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_gdn_ab_65ffc5>>(
                         sycl::nd_range<3>(sycl::range(1, T, rows8(2 * HV)) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -3091,7 +3268,7 @@ work-group size if needed.
                             sycl::ext::oneapi::experimental::use_root_sync};
 
                     ((sycl::queue *)(st))
-                        ->parallel_for<dpct_kernel_name<class k_gdn_gb_7a0f9c>>(
+                        ->parallel_for<dpct_kernel_name<class k_gdn_gb_9252c2>>(
                             sycl::nd_range<3>(
                                 sycl::range(1, 1, grid1((int64_t)HV * T)) *
                                     sycl::range(1, 1, kThreads),
@@ -3101,7 +3278,6 @@ work-group size if needed.
                             });
                 }
             }
-            (void)0;
             if (rows_mode) {   // batch rows: a slot's rows (one, or a verify window's two) in sequence on its own state
                 {
                     auto exp_props =
@@ -3119,7 +3295,7 @@ work-group size if needed.
                         const int32_t *d_gcnt_ct12 = d_gcnt;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_conv_seq_d83314>>(
+                            dpct_kernel_name<class k_conv_seq_51f9c5>>(
                             sycl::nd_range<3>(sycl::range(1, rows_G, C / 128) *
                                                   sycl::range(1, 1, 128),
                                               sycl::range(1, 1, 128)),
@@ -3135,7 +3311,7 @@ work-group size if needed.
                     });
                 }
                 /*
-                DPCT1049:43: The work-group size passed to the SYCL kernel may
+                DPCT1049:44: The work-group size passed to the SYCL kernel may
                 exceed the limit. To get the device limit, query
                 info::device::max_work_group_size. Adjust the work-group size if
                 needed.
@@ -3157,7 +3333,7 @@ work-group size if needed.
                         const int32_t *d_gcnt_ct16 = d_gcnt;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_gdn_seq_599101>>(
+                            dpct_kernel_name<class k_gdn_seq_c1f2c7>>(
                             sycl::nd_range<3>(sycl::range(1, rows_G, HV) *
                                                   sycl::range(1, 4, 128),
                                               sycl::range(1, 4, 128)),
@@ -3193,7 +3369,7 @@ work-group size if needed.
                         auto verify_ct8 = !verify;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_conv_seq_7ee81c>>(
+                            dpct_kernel_name<class k_conv_seq_a4f154>>(
                             sycl::nd_range<3>(sycl::range(1, tiles, C / 128) *
                                                   sycl::range(1, 1, 128),
                                               sycl::range(1, 1, 128)),
@@ -3209,7 +3385,7 @@ work-group size if needed.
                 }
                 if (T > kGemmT && !verify) {   // a prompt chunk: the column-split delta rule, then the norm
                     /*
-                    DPCT1049:44: The work-group size passed to the SYCL kernel
+                    DPCT1049:45: The work-group size passed to the SYCL kernel
                     may exceed the limit. To get the device limit, query
                     info::device::max_work_group_size. Adjust the work-group
                     size if needed.
@@ -3224,7 +3400,7 @@ work-group size if needed.
                             auto gdn_y_ct5 = gdn_y;
 
                             cgh.parallel_for<
-                                dpct_kernel_name<class k_gdn_seq_cols_3ce524>>(
+                                dpct_kernel_name<class k_gdn_seq_cols_f647e0>>(
                                 sycl::nd_range<3>(
                                     sycl::range(1, kGdnColGroups, HV) *
                                         sycl::range(1, 16, 128 / kGdnColGroups),
@@ -3247,7 +3423,7 @@ work-group size if needed.
                             auto gdn_y_ct4 = gdn_y;
 
                             cgh.parallel_for<
-                                dpct_kernel_name<class k_gdn_norm_23f2dc>>(
+                                dpct_kernel_name<class k_gdn_norm_e099d6>>(
                                 sycl::nd_range<3>(sycl::range(1, T, HV) *
                                                       sycl::range(1, 1, 128),
                                                   sycl::range(1, 1, 128)),
@@ -3261,7 +3437,7 @@ work-group size if needed.
                     }
                 } else {   // decode, verify windows and commits: one kernel, so a window's rows are a decode step's rows
                            /*
-                           DPCT1049:45: The work-group size passed to the SYCL kernel
+                           DPCT1049:46: The work-group size passed to the SYCL kernel
                            may exceed the limit. To get the device limit, query
                            info::device::max_work_group_size. Adjust the work-group
                            size if needed.
@@ -3278,7 +3454,7 @@ work-group size if needed.
                         auto verify_ct12 = !verify;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_gdn_seq_aaa6b4>>(
+                            dpct_kernel_name<class k_gdn_seq_411de6>>(
                             sycl::nd_range<3>(sycl::range(1, 1, HV) *
                                                   sycl::range(1, 4, 128),
                                               sycl::range(1, 4, 128)),
@@ -3307,10 +3483,17 @@ work-group size if needed.
                 rs.delta = d_rdelta;
                 rs.kc = d_kc_tab + li * n_sess;
                 rs.vc = d_vc_tab + li * n_sess;
+                if (kv_q8) {
+                    rs.ksc = d_ksc_tab + li * n_sess;
+                    rs.vsc = d_vsc_tab + li * n_sess;
+                }
             }
+            if (kv_q8)
             {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{
                     sycl::ext::oneapi::experimental::use_root_sync};
+                dpct::has_capability_or_fail(
+                    ((sycl::queue *)(st))->get_device(), {sycl::aspect::fp16});
 
                 ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
                     const float *qg_ct0 = qg;
@@ -3322,25 +3505,69 @@ work-group size if needed.
                         rows_mode ? nullptr : kc[li];
                     auto rows_mode_nullptr_vc_li_ct8 =
                         rows_mode ? nullptr : vc[li];
-                    auto m_n_rot_ct12 = m->n_rot;
-                    auto ctx_ct14 = ctx;
-                    auto m_rope_base_ct15 = m->rope_base;
-                    auto m_eps_ct16 = m->eps;
-                    const int32_t *d_delta_ct17 = d_delta;
-                    auto mtab_now_ct18 = mtab_now;
+                    auto rows_mode_nullptr_ksc_li_ct9 =
+                        rows_mode ? nullptr : ksc[li];
+                    auto rows_mode_nullptr_vsc_li_ct10 =
+                        rows_mode ? nullptr : vsc[li];
+                    auto m_n_rot_ct14 = m->n_rot;
+                    auto ctx_ct16 = ctx;
+                    auto m_rope_base_ct17 = m->rope_base;
+                    auto m_eps_ct18 = m->eps;
+                    const int32_t *d_delta_ct19 = d_delta;
+                    auto mtab_now_ct20 = mtab_now;
 
-                    cgh.parallel_for<
-                        dpct_kernel_name<class k_attn_prep_85ef6c>>(
+                    cgh.parallel_for<dpct_kernel_name<
+                        class k_attn_prep_6a47d6, dpct_kernel_scalar<true>>>(
                         sycl::nd_range<3>(sycl::range(1, T, H + HKV) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
                         exp_props, [=](sycl::nd_item<3> item_ct1) {
-                            k_attn_prep(
+                            k_attn_prep<true>(
                                 qg_ct0, kx_ct1, vx_ct2, L.q_norm, L.k_norm,
                                 q_ct5, gate_ct6, rows_mode_nullptr_kc_li_ct7,
-                                rows_mode_nullptr_vc_li_ct8, H, HKV, HD,
-                                m_n_rot_ct12, dpos, ctx_ct14, m_rope_base_ct15,
-                                m_eps_ct16, d_delta_ct17, mtab_now_ct18, rs);
+                                rows_mode_nullptr_vc_li_ct8,
+                                rows_mode_nullptr_ksc_li_ct9,
+                                rows_mode_nullptr_vsc_li_ct10, H, HKV, HD,
+                                m_n_rot_ct14, dpos, ctx_ct16, m_rope_base_ct17,
+                                m_eps_ct18, d_delta_ct19, mtab_now_ct20, rs);
+                        });
+                });
+            } else {
+                auto exp_props = sycl::ext::oneapi::experimental::properties{
+                    sycl::ext::oneapi::experimental::use_root_sync};
+                dpct::has_capability_or_fail(
+                    ((sycl::queue *)(st))->get_device(), {sycl::aspect::fp16});
+
+                ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+                    const float *qg_ct0 = qg;
+                    const float *kx_ct1 = kx;
+                    const float *vx_ct2 = vx;
+                    auto q_ct5 = q;
+                    auto gate_ct6 = gate;
+                    auto rows_mode_nullptr_kc_li_ct7 =
+                        rows_mode ? nullptr : kc[li];
+                    auto rows_mode_nullptr_vc_li_ct8 =
+                        rows_mode ? nullptr : vc[li];
+                    auto m_n_rot_ct14 = m->n_rot;
+                    auto ctx_ct16 = ctx;
+                    auto m_rope_base_ct17 = m->rope_base;
+                    auto m_eps_ct18 = m->eps;
+                    const int32_t *d_delta_ct19 = d_delta;
+                    auto mtab_now_ct20 = mtab_now;
+
+                    cgh.parallel_for<dpct_kernel_name<
+                        class k_attn_prep_e668e8, dpct_kernel_scalar<false>>>(
+                        sycl::nd_range<3>(sycl::range(1, T, H + HKV) *
+                                              sycl::range(1, 1, kThreads),
+                                          sycl::range(1, 1, kThreads)),
+                        exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            k_attn_prep<false>(
+                                qg_ct0, kx_ct1, vx_ct2, L.q_norm, L.k_norm,
+                                q_ct5, gate_ct6, rows_mode_nullptr_kc_li_ct7,
+                                rows_mode_nullptr_vc_li_ct8, nullptr, nullptr,
+                                H, HKV, HD, m_n_rot_ct14, dpos, ctx_ct16,
+                                m_rope_base_ct17, m_eps_ct18, d_delta_ct19,
+                                mtab_now_ct20, rs);
                         });
                 });
             }
@@ -3353,6 +3580,7 @@ work-group size if needed.
                 const int tq = (int) std::max<int64_t>(1, std::min<int64_t>(T, (int64_t) (kAttScoreFloats / ((size_t) H * ldp))));
                 const int G = H / HKV;
                 const float one = 1.0f, zero = 0.0f;
+                if (kv_q8)
                 {
                     auto exp_props =
                         sycl::ext::oneapi::experimental::properties{
@@ -3362,22 +3590,53 @@ work-group size if needed.
                         {sycl::aspect::fp16});
 
                     ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
-                        const float *kc_li_ct0 = kc[li];
-                        const float *vc_li_ct1 = vc[li];
-                        auto k16_ct2 = k16;
-                        auto v16_ct3 = v16;
-                        auto ctx_ct4 = ctx;
+                        const void *kc_li_ct0 = kc[li];
+                        const void *vc_li_ct1 = vc[li];
+                        const uint16_t *ksc_li_ct2 = ksc[li];
+                        const uint16_t *vsc_li_ct3 = vsc[li];
+                        auto k16_ct4 = k16;
+                        auto v16_ct5 = v16;
+                        auto ctx_ct6 = ctx;
 
-                        cgh.parallel_for<
-                            dpct_kernel_name<class k_kv_f16_3e17dd>>(
+                        cgh.parallel_for<dpct_kernel_name<
+                            class k_kv_f16_d922c6, dpct_kernel_scalar<true>>>(
                             sycl::nd_range<3>(
                                 sycl::range(1, 1,
                                             grid1((int64_t)HKV * P * HD)) *
                                     sycl::range(1, 1, kThreads),
                                 sycl::range(1, 1, kThreads)),
                             exp_props, [=](sycl::nd_item<3> item_ct1) {
-                                k_kv_f16(kc_li_ct0, vc_li_ct1, k16_ct2, v16_ct3,
-                                         ctx_ct4, P, HD, HKV);
+                                k_kv_f16<true>(kc_li_ct0, vc_li_ct1, ksc_li_ct2,
+                                               vsc_li_ct3, k16_ct4, v16_ct5,
+                                               ctx_ct6, P, HD, HKV);
+                            });
+                    });
+                } else {
+                    auto exp_props =
+                        sycl::ext::oneapi::experimental::properties{
+                            sycl::ext::oneapi::experimental::use_root_sync};
+                    dpct::has_capability_or_fail(
+                        ((sycl::queue *)(st))->get_device(),
+                        {sycl::aspect::fp16});
+
+                    ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+                        const void *kc_li_ct0 = kc[li];
+                        const void *vc_li_ct1 = vc[li];
+                        auto k16_ct4 = k16;
+                        auto v16_ct5 = v16;
+                        auto ctx_ct6 = ctx;
+
+                        cgh.parallel_for<dpct_kernel_name<
+                            class k_kv_f16_6ccd49, dpct_kernel_scalar<false>>>(
+                            sycl::nd_range<3>(
+                                sycl::range(1, 1,
+                                            grid1((int64_t)HKV * P * HD)) *
+                                    sycl::range(1, 1, kThreads),
+                                sycl::range(1, 1, kThreads)),
+                            exp_props, [=](sycl::nd_item<3> item_ct1) {
+                                k_kv_f16<false>(kc_li_ct0, vc_li_ct1, nullptr,
+                                                nullptr, k16_ct4, v16_ct5,
+                                                ctx_ct6, P, HD, HKV);
                             });
                     });
                 }
@@ -3395,7 +3654,7 @@ work-group size if needed.
                         auto int64_t_T_H_HD_ct2 = (int64_t)T * H * HD;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_to_f16_f5d155>>(
+                            dpct_kernel_name<class k_to_f16_29d185>>(
                             sycl::nd_range<3>(
                                 sycl::range(1, 1, grid1((int64_t)T * H * HD)) *
                                     sycl::range(1, 1, kThreads),
@@ -3439,7 +3698,7 @@ work-group size if needed.
                             auto sqrtf_float_HD_ct6 = 1.0f / sqrtf((float)HD);
 
                             cgh.parallel_for<dpct_kernel_name<
-                                class k_attn_softmax16_2360ba>>(
+                                class k_attn_softmax16_8db458>>(
                                 sycl::nd_range<3>(
                                     sycl::range(1, H, nt) *
                                         sycl::range(1, 1, kThreads),
@@ -3491,7 +3750,7 @@ work-group size if needed.
                         auto int64_t_T_H_HD_ct2 = (int64_t)T * H * HD;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_gate_mul_e4b88d>>(
+                            dpct_kernel_name<class k_gate_mul_d92808>>(
                             sycl::nd_range<3>(
                                 sycl::range(1, 1, grid1((int64_t)T * H * HD)) *
                                     sycl::range(1, 1, kThreads),
@@ -3510,42 +3769,90 @@ work-group size if needed.
                     const int nt = std::min(rows_per, T - t0);
                     const int nc = graph_mode ? n_chunk
                                               : (int) std::min<int64_t>(n_chunk, (p0 + t0 + nt + kChunkCells - 1) / kChunkCells);
+                    if (kv_q8)
                     {
                         auto exp_props =
                             sycl::ext::oneapi::experimental::properties{
                                 sycl::ext::oneapi::experimental::use_root_sync};
+                        dpct::has_capability_or_fail(
+                            ((sycl::queue *)(st))->get_device(),
+                            {sycl::aspect::fp16});
 
                         ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
                             const float *q_ct0 = q;
-                            const float *rows_mode_nullptr_kc_li_ct1 =
+                            const void *rows_mode_nullptr_kc_li_ct1 =
                                 rows_mode ? nullptr : kc[li];
-                            const float *rows_mode_nullptr_vc_li_ct2 =
+                            const void *rows_mode_nullptr_vc_li_ct2 =
                                 rows_mode ? nullptr : vc[li];
-                            auto ctx_ct7 = ctx;
-                            auto sqrtf_float_HD_ct8 = 1.0f / sqrtf((float)HD);
-                            auto n_chunk_ct9 = n_chunk;
-                            auto pacc_ct10 = pacc;
-                            auto pm_ct11 = pm;
-                            auto pl_ct12 = pl;
+                            const uint16_t *rows_mode_nullptr_ksc_li_ct3 =
+                                rows_mode ? nullptr : ksc[li];
+                            const uint16_t *rows_mode_nullptr_vsc_li_ct4 =
+                                rows_mode ? nullptr : vsc[li];
+                            auto ctx_ct9 = ctx;
+                            auto sqrtf_float_HD_ct10 = 1.0f / sqrtf((float)HD);
+                            auto n_chunk_ct11 = n_chunk;
+                            auto pacc_ct12 = pacc;
+                            auto pm_ct13 = pm;
+                            auto pl_ct14 = pl;
 
                             cgh.parallel_for<
-                                dpct_kernel_name<class k_attn_part_af0c1e>>(
+                                dpct_kernel_name<class k_attn_part_8d6414,
+                                                 dpct_kernel_scalar<true>>>(
                                 sycl::nd_range<3>(
                                     sycl::range(1, nt * H, nc) *
                                         sycl::range(1, 1, kChunkCells),
                                     sycl::range(1, 1, kChunkCells)),
                                 exp_props, [=](sycl::nd_item<3> item_ct1) {
-                                    k_attn_part(
+                                    k_attn_part<true>(
                                         q_ct0, rows_mode_nullptr_kc_li_ct1,
-                                        rows_mode_nullptr_vc_li_ct2, dpos, t0,
-                                        H, HKV, ctx_ct7, sqrtf_float_HD_ct8,
-                                        n_chunk_ct9, pacc_ct10, pm_ct11,
-                                        pl_ct12, rs);
+                                        rows_mode_nullptr_vc_li_ct2,
+                                        rows_mode_nullptr_ksc_li_ct3,
+                                        rows_mode_nullptr_vsc_li_ct4, dpos, t0,
+                                        H, HKV, ctx_ct9, sqrtf_float_HD_ct10,
+                                        n_chunk_ct11, pacc_ct12, pm_ct13,
+                                        pl_ct14, rs);
+                                });
+                        });
+                    } else {
+                        auto exp_props =
+                            sycl::ext::oneapi::experimental::properties{
+                                sycl::ext::oneapi::experimental::use_root_sync};
+                        dpct::has_capability_or_fail(
+                            ((sycl::queue *)(st))->get_device(),
+                            {sycl::aspect::fp16});
+
+                        ((sycl::queue *)(st))->submit([&](sycl::handler &cgh) {
+                            const float *q_ct0 = q;
+                            const void *rows_mode_nullptr_kc_li_ct1 =
+                                rows_mode ? nullptr : kc[li];
+                            const void *rows_mode_nullptr_vc_li_ct2 =
+                                rows_mode ? nullptr : vc[li];
+                            auto ctx_ct9 = ctx;
+                            auto sqrtf_float_HD_ct10 = 1.0f / sqrtf((float)HD);
+                            auto n_chunk_ct11 = n_chunk;
+                            auto pacc_ct12 = pacc;
+                            auto pm_ct13 = pm;
+                            auto pl_ct14 = pl;
+
+                            cgh.parallel_for<
+                                dpct_kernel_name<class k_attn_part_76bf8c,
+                                                 dpct_kernel_scalar<false>>>(
+                                sycl::nd_range<3>(
+                                    sycl::range(1, nt * H, nc) *
+                                        sycl::range(1, 1, kChunkCells),
+                                    sycl::range(1, 1, kChunkCells)),
+                                exp_props, [=](sycl::nd_item<3> item_ct1) {
+                                    k_attn_part<false>(
+                                        q_ct0, rows_mode_nullptr_kc_li_ct1,
+                                        rows_mode_nullptr_vc_li_ct2, nullptr,
+                                        nullptr, dpos, t0, H, HKV, ctx_ct9,
+                                        sqrtf_float_HD_ct10, n_chunk_ct11,
+                                        pacc_ct12, pm_ct13, pl_ct14, rs);
                                 });
                         });
                     }
                     /*
-                    DPCT1049:46: The work-group size passed to the SYCL kernel
+                    DPCT1049:47: The work-group size passed to the SYCL kernel
                     may exceed the limit. To get the device limit, query
                     info::device::max_work_group_size. Adjust the work-group
                     size if needed.
@@ -3564,7 +3871,7 @@ work-group size if needed.
                             auto att_ct8 = att;
 
                             cgh.parallel_for<
-                                dpct_kernel_name<class k_attn_merge_caf370>>(
+                                dpct_kernel_name<class k_attn_merge_bd57d4>>(
                                 sycl::nd_range<3>(sycl::range(1, 1, nt * H) *
                                                       sycl::range(1, 1, HD),
                                                   sycl::range(1, 1, HD)),
@@ -3577,7 +3884,6 @@ work-group size if needed.
                     }
                 }
             }
-            (void)0;
             mm(L.wo, att, y, T);
         }
         add_rms_post(L, T);
@@ -3613,7 +3919,7 @@ work-group size if needed.
                     auto rcnt_ct2 = rcnt;
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class k_route_count_84a017>>(
+                        dpct_kernel_name<class k_route_count_b5509c>>(
                         sycl::nd_range<3>(sycl::range(1, 1, grid1(n_ent)) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -3633,7 +3939,7 @@ work-group size if needed.
                     auto rmax_ct4 = rmax;
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class k_route_scan_3fa591>>(
+                        dpct_kernel_name<class k_route_scan_3d3978>>(
                         sycl::nd_range<3>(sycl::range(1, 1, 32),
                                           sycl::range(1, 1, 32)),
                         exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -3654,7 +3960,7 @@ work-group size if needed.
                     auto rinv_ct6 = rinv;
 
                     cgh.parallel_for<
-                        dpct_kernel_name<class k_route_scatter_724911>>(
+                        dpct_kernel_name<class k_route_scatter_a0a468>>(
                         sycl::nd_range<3>(sycl::range(1, 1, grid1(n_ent)) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -3665,14 +3971,14 @@ work-group size if needed.
                 });
             }
             /*
-            DPCT1124:95: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+            DPCT1124:97: cudaMemcpyAsync is migrated to asynchronous memcpy API.
             While the origin API might be synchronous, it depends on the type of
             operand memory, so you may need to call wait() on event return by
             memcpy API to ensure synchronization behavior.
             */
             CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 10, rmax, 4)));
             /*
-            DPCT1124:96: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+            DPCT1124:98: cudaMemcpyAsync is migrated to asynchronous memcpy API.
             While the origin API might be synchronous, it depends on the type of
             operand memory, so you may need to call wait() on event return by
             memcpy API to ensure synchronization behavior.
@@ -3717,7 +4023,7 @@ work-group size if needed.
                 auto x16_ct1 = x16;
                 auto int64_t_N_T_ct2 = (int64_t)N * T;
 
-                cgh.parallel_for<dpct_kernel_name<class k_to_f16_f737e7>>(
+                cgh.parallel_for<dpct_kernel_name<class k_to_f16_32fd92>>(
                     sycl::nd_range<3>(sycl::range(1, 1, grid1((int64_t)N * T)) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3746,7 +4052,7 @@ work-group size if needed.
                     auto shh_ct2 = shh;
                     auto int64_t_T_FS_ct3 = (int64_t)T * FS;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_swiglu_f63d03>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_swiglu_fe75ce>>(
                         sycl::nd_range<3>(
                             sycl::range(1, 1, grid1((int64_t)T * FS)) *
                                 sycl::range(1, 1, kThreads),
@@ -3791,7 +4097,7 @@ work-group size if needed.
                 const float *d_img_ct1 = d_img;
                 const int32_t *d_map_ct2 = d_map;
 
-                cgh.parallel_for<dpct_kernel_name<class k_put_rows_9cd20b>>(
+                cgh.parallel_for<dpct_kernel_name<class k_put_rows_3574c4>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3810,7 +4116,7 @@ work-group size if needed.
                 auto h_ct2 = h;
                 auto m_eps_ct4 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_rms_658337>>(
+                cgh.parallel_for<dpct_kernel_name<class k_rms_d1aa35>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3839,7 +4145,7 @@ work-group size if needed.
                 auto amv_ct3 = amv;
                 auto ami_ct4 = ami;
 
-                cgh.parallel_for<dpct_kernel_name<class k_argmax_9930be>>(
+                cgh.parallel_for<dpct_kernel_name<class k_argmax_c81aff>>(
                     sycl::nd_range<3>(sycl::range(1, n, kArgBlocks) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3858,7 +4164,7 @@ work-group size if needed.
                 auto amv_ct3 = amv;
                 auto ami_ct4 = ami;
 
-                cgh.parallel_for<dpct_kernel_name<class k_argmax_c8acba>>(
+                cgh.parallel_for<dpct_kernel_name<class k_argmax_e17c71>>(
                     sycl::nd_range<3>(sycl::range(1, n, 1) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3904,7 +4210,7 @@ work-group size if needed.
                 auto amv_ct3 = amv;
                 auto ami_ct4 = ami;
 
-                cgh.parallel_for<dpct_kernel_name<class k_argmax_d76d41>>(
+                cgh.parallel_for<dpct_kernel_name<class k_argmax_6fee3e>>(
                     sycl::nd_range<3>(sycl::range(1, 1, kArgBlocks) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3925,7 +4231,7 @@ work-group size if needed.
                 auto amv_ct3 = amv;
                 auto ami_ct4 = ami;
 
-                cgh.parallel_for<dpct_kernel_name<class k_argmax_922f0a>>(
+                cgh.parallel_for<dpct_kernel_name<class k_argmax_b5eb06>>(
                     sycl::nd_range<3>(sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
                     exp_props, [=](sycl::nd_item<3> item_ct1) {
@@ -3953,7 +4259,7 @@ work-group size if needed.
                 const float *d_img_ct1 = d_img;
                 const int32_t *d_map_ct2 = d_map;
 
-                cgh.parallel_for<dpct_kernel_name<class k_put_rows_bd57d4>>(
+                cgh.parallel_for<dpct_kernel_name<class k_put_rows_2c2fda>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3973,7 +4279,7 @@ work-group size if needed.
                 auto N_ct4 = 2 * N;
                 auto m_eps_ct6 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_rms_ld_261875>>(
+                cgh.parallel_for<dpct_kernel_name<class k_rms_ld_f5aaf7>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -3993,7 +4299,7 @@ work-group size if needed.
                 auto N_ct4 = 2 * N;
                 auto m_eps_ct6 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_rms_ld_d57ba1>>(
+                cgh.parallel_for<dpct_kernel_name<class k_rms_ld_cfd70f>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -4014,7 +4320,7 @@ work-group size if needed.
                 auto h_ct2 = h;
                 auto m_eps_ct4 = m->eps;
 
-                cgh.parallel_for<dpct_kernel_name<class k_rms_e2ab28>>(
+                cgh.parallel_for<dpct_kernel_name<class k_rms_8222d1>>(
                     sycl::nd_range<3>(sycl::range(1, 1, T) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -4046,7 +4352,7 @@ work-group size if needed.
                     auto HK_ct5 = 2 * HK;
                     auto m_eps_ct6 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_conv_seq_977bca>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_conv_seq_f8c874>>(
                         sycl::nd_range<3>(sycl::range(1, 1, C / 128) *
                                               sycl::range(1, 1, 128),
                                           sycl::range(1, 1, 128)),
@@ -4061,7 +4367,7 @@ work-group size if needed.
                 });
             }
             /*
-            DPCT1049:47: The work-group size passed to the SYCL kernel may
+            DPCT1049:48: The work-group size passed to the SYCL kernel may
             exceed the limit. To get the device limit, query
             info::device::max_work_group_size. Adjust the work-group size if
             needed.
@@ -4078,7 +4384,7 @@ work-group size if needed.
                     const float *z_ct5 = z;
                     auto m_eps_ct7 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_gdn_seq_765c43>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_gdn_seq_ec83ae>>(
                         sycl::nd_range<3>(sycl::range(1, 1, HV) *
                                               sycl::range(1, 4, 128),
                                           sycl::range(1, 4, 128)),
@@ -4120,7 +4426,7 @@ work-group size if needed.
         // (RTX 3060, UD-Q4_K_XL at 37 of 256: pp2048 1970 whole vs 1540 in runs)
         if (all || 2 * L.n_slots < ne) {
             /*
-            DPCT1124:97: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+            DPCT1124:99: cudaMemcpyAsync is migrated to asynchronous memcpy API.
             While the origin API might be synchronous, it depends on the type of
             operand memory, so you may need to call wait() on event return by
             memcpy API to ensure synchronization behavior.
@@ -4138,7 +4444,7 @@ work-group size if needed.
                 const size_t n = (size_t) (y - x) * L.stride;
                 if (dev)
                     /*
-                    DPCT1124:98: cudaMemcpyAsync is migrated to asynchronous
+                    DPCT1124:100: cudaMemcpyAsync is migrated to asynchronous
                     memcpy API. While the origin API might be synchronous, it
                     depends on the type of operand memory, so you may need to
                     call wait() on event return by memcpy API to ensure
@@ -4149,7 +4455,7 @@ work-group size if needed.
                         L.blobs + (size_t)H.slot_of[(size_t)x] * L.stride, n)));
                 else
                     /*
-                    DPCT1124:99: cudaMemcpyAsync is migrated to asynchronous
+                    DPCT1124:101: cudaMemcpyAsync is migrated to asynchronous
                     memcpy API. While the origin API might be synchronous, it
                     depends on the type of operand memory, so you may need to
                     call wait() on event return by memcpy API to ensure
@@ -4162,12 +4468,12 @@ work-group size if needed.
             }
         }
         /*
-        DPCT1012:100: Detected kernel execution time measurement pattern and
+        DPCT1012:102: Detected kernel execution time measurement pattern and
         generated an initial code for time measurements in SYCL. You can change
         the way time is measured depending on your goals.
         */
         /*
-        DPCT1024:101: The original code returned the error code that was further
+        DPCT1024:103: The original code returned the error code that was further
         consumed by the program logic. This original code was replaced with 0.
         You may need to rewrite the program logic consuming the error code.
         */
@@ -4196,12 +4502,12 @@ work-group size if needed.
     void stream_done() try {
         const int b = stream_pos % 2;
         /*
-        DPCT1012:102: Detected kernel execution time measurement pattern and
+        DPCT1012:104: Detected kernel execution time measurement pattern and
         generated an initial code for time measurements in SYCL. You can change
         the way time is measured depending on your goals.
         */
         /*
-        DPCT1024:103: The original code returned the error code that was further
+        DPCT1024:105: The original code returned the error code that was further
         consumed by the program logic. This original code was replaced with 0.
         You may need to rewrite the program logic consuming the error code.
         */
@@ -4222,26 +4528,26 @@ work-group size if needed.
         const int N = (int) g.n_embd, Kp = (int) m->top_k;
         const int64_t n_ent = (int64_t) T * Kp;
         /*
-        DPCT1124:104: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:106: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(h_ids, ids, (size_t)n_ent * 4)));
         /*
-        DPCT1124:105: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:107: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(h_h, h, (size_t)T * N * 4)));
         /*
-        DPCT1012:106: Detected kernel execution time measurement pattern and
+        DPCT1012:108: Detected kernel execution time measurement pattern and
         generated an initial code for time measurements in SYCL. You can change
         the way time is measured depending on your goals.
         */
         /*
-        DPCT1024:107: The original code returned the error code that was further
+        DPCT1024:109: The original code returned the error code that was further
         consumed by the program logic. This original code was replaced with 0.
         You may need to rewrite the program logic consuming the error code.
         */
@@ -4309,14 +4615,14 @@ work-group size if needed.
         pool->run_split_multi_native(H.fmt, jobs.data(), (int) jobs.size());
         hy_cpu_ms += ms_since(t0);
         /*
-        DPCT1124:108: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:110: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(ecpu, cpu_out, (size_t)n_ent * N * 4)));
         /*
-        DPCT1124:109: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:111: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -4331,7 +4637,7 @@ work-group size if needed.
                 const float *ecpu_ct1 = ecpu;
                 const int32_t *d_miss_ct2 = d_miss;
 
-                cgh.parallel_for<dpct_kernel_name<class k_merge_cpu_64d646>>(
+                cgh.parallel_for<dpct_kernel_name<class k_merge_cpu_a401c8>>(
                     sycl::nd_range<3>(sycl::range(1, 1, n_ent) *
                                           sycl::range(1, 1, kThreads),
                                       sycl::range(1, 1, kThreads)),
@@ -4387,7 +4693,7 @@ work-group size if needed.
                     H.slot_of[(size_t) x] = s;
                     H.exp_in_slot[(size_t) s] = x;
                     /*
-                    DPCT1124:110: cudaMemcpyAsync is migrated to asynchronous
+                    DPCT1124:112: cudaMemcpyAsync is migrated to asynchronous
                     memcpy API. While the origin API might be synchronous, it
                     depends on the type of operand memory, so you may need to
                     call wait() on event return by memcpy API to ensure
@@ -4405,7 +4711,7 @@ work-group size if needed.
             }
             if (changed)
                 /*
-                DPCT1124:111: cudaMemcpyAsync is migrated to asynchronous memcpy
+                DPCT1124:113: cudaMemcpyAsync is migrated to asynchronous memcpy
                 API. While the origin API might be synchronous, it depends on
                 the type of operand memory, so you may need to call wait() on
                 event return by memcpy API to ensure synchronization behavior.
@@ -4495,14 +4801,14 @@ work-group size if needed.
             img_cap = need;
         }
         /*
-        DPCT1114:112: cudaMemcpy is migrated to asynchronization memcpy,
+        DPCT1114:114: cudaMemcpy is migrated to asynchronization memcpy,
         assuming in the original code the source host memory is pageable memory.
         If the memory is not pageable, call wait() on event return by memcpy API
         to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(q_ct1.memcpy(d_img, rows.data(), need * 4)));
         /*
-        DPCT1114:113: cudaMemcpy is migrated to asynchronization memcpy,
+        DPCT1114:115: cudaMemcpy is migrated to asynchronization memcpy,
         assuming in the original code the source host memory is pageable memory.
         If the memory is not pageable, call wait() on event return by memcpy API
         to ensure synchronization behavior.
@@ -4542,7 +4848,7 @@ work-group size if needed.
         }
         if (any) {
             /*
-            DPCT1124:114: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:116: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
@@ -4577,14 +4883,14 @@ work-group size if needed.
             hpin[0] = toks[0];
             hpin[1] = (int32_t) pos;
             /*
-            DPCT1124:115: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:117: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
             */
             CK(DPCT_CHECK_ERROR(st->memcpy(tok, hpin, 4)));
             /*
-            DPCT1124:116: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:118: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
@@ -4599,7 +4905,7 @@ work-group size if needed.
             map_on = false;
             rows_deferred = false;
             /*
-            DPCT1124:117: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:119: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
@@ -4615,14 +4921,14 @@ work-group size if needed.
             CK(DPCT_CHECK_ERROR(st->wait()));
             hpin[1] = (int32_t) pos;
             /*
-            DPCT1124:118: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:120: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
             */
             CK(DPCT_CHECK_ERROR(st->memcpy(tok, toks + i, (size_t)T * 4)));
             /*
-            DPCT1124:119: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:121: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
@@ -4633,7 +4939,7 @@ work-group size if needed.
             if (m->has_mtp && mtp_d > 0) {
                 // seeds: h_{q-1} for each row q: hlast, then this chunk's rows 0 .. T - 2 (in `y`, free here)
                 /*
-                DPCT1124:120: cudaMemcpyAsync is migrated to asynchronous memcpy
+                DPCT1124:122: cudaMemcpyAsync is migrated to asynchronous memcpy
                 API. While the origin API might be synchronous, it depends on
                 the type of operand memory, so you may need to call wait() on
                 event return by memcpy API to ensure synchronization behavior.
@@ -4642,7 +4948,7 @@ work-group size if needed.
                     st->memcpy(mtp_seed(), hlast, (size_t)N * 4)));
                 if (T > 1)
                     /*
-                    DPCT1124:121: cudaMemcpyAsync is migrated to asynchronous
+                    DPCT1124:123: cudaMemcpyAsync is migrated to asynchronous
                     memcpy API. While the origin API might be synchronous, it
                     depends on the type of operand memory, so you may need to
                     call wait() on event return by memcpy API to ensure
@@ -4651,7 +4957,7 @@ work-group size if needed.
                     CK(DPCT_CHECK_ERROR(st->memcpy(mtp_seed() + N, hmain,
                                                    (size_t)(T - 1) * N * 4)));
                 /*
-                DPCT1124:122: cudaMemcpyAsync is migrated to asynchronous memcpy
+                DPCT1124:124: cudaMemcpyAsync is migrated to asynchronous memcpy
                 API. While the origin API might be synchronous, it depends on
                 the type of operand memory, so you may need to call wait() on
                 event return by memcpy API to ensure synchronization behavior.
@@ -4659,7 +4965,7 @@ work-group size if needed.
                 CK(DPCT_CHECK_ERROR(
                     st->memcpy(tok_m, toks + i, (size_t)T * 4)));
                 /*
-                DPCT1124:123: cudaMemcpyAsync is migrated to asynchronous memcpy
+                DPCT1124:125: cudaMemcpyAsync is migrated to asynchronous memcpy
                 API. While the origin API might be synchronous, it depends on
                 the type of operand memory, so you may need to call wait() on
                 event return by memcpy API to ensure synchronization behavior.
@@ -4668,7 +4974,7 @@ work-group size if needed.
                 forward_mtp(T, pos, mtp_seed(), false, false);
             }
             /*
-            DPCT1124:124: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:126: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
@@ -4727,49 +5033,49 @@ work-group size if needed.
             pmax = std::max<int64_t>(pmax, ss.pos + gr[g].n - 1);
         }
         /*
-        DPCT1124:125: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:127: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(tok, hrow, (size_t)T * 4)));
         /*
-        DPCT1124:126: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:128: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(d_rcell, hrow + 8, (size_t)T * 4)));
         /*
-        DPCT1124:127: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:129: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(d_rslot, hrow + 16, (size_t)T * 4)));
         /*
-        DPCT1124:128: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:130: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(d_rdelta, hrow + 24, (size_t)T * 4)));
         /*
-        DPCT1124:129: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:131: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(d_gslot, hrow + 40, (size_t)G * 4)));
         /*
-        DPCT1124:130: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:132: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(d_grow0, hrow + 48, (size_t)G * 4)));
         /*
-        DPCT1124:131: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:133: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -4784,7 +5090,7 @@ work-group size if needed.
         rows_deferred = false;
         rows_mode = false;
         /*
-        DPCT1124:132: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:134: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -4815,7 +5121,7 @@ work-group size if needed.
         sess[(size_t) cur].pos = pos;
         for (int i = 0; i < G; ++i) hrow[56 + i] = keep[i];   // (hrow's slot / first-row words are the window's, unchanged)
         /*
-        DPCT1124:133: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:135: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -4844,7 +5150,7 @@ work-group size if needed.
                         const int32_t *d_gcnt_ct12 = d_gcnt;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_conv_seq_15ca4b>>(
+                            dpct_kernel_name<class k_conv_seq_700b80>>(
                             sycl::nd_range<3>(sycl::range(1, G, C / 128) *
                                                   sycl::range(1, 1, 128),
                                               sycl::range(1, 1, 128)),
@@ -4860,7 +5166,7 @@ work-group size if needed.
                     });
                 }
                 /*
-                DPCT1049:48: The work-group size passed to the SYCL kernel may
+                DPCT1049:49: The work-group size passed to the SYCL kernel may
                 exceed the limit. To get the device limit, query
                 info::device::max_work_group_size. Adjust the work-group size if
                 needed.
@@ -4883,7 +5189,7 @@ work-group size if needed.
                         const int32_t *d_gcnt_ct16 = d_gcnt;
 
                         cgh.parallel_for<
-                            dpct_kernel_name<class k_gdn_seq_4b5f3b>>(
+                            dpct_kernel_name<class k_gdn_seq_5fb606>>(
                             sycl::nd_range<3>(sycl::range(1, G, HV) *
                                                   sycl::range(1, 4, 128),
                                               sycl::range(1, 4, 128)),
@@ -4931,7 +5237,7 @@ work-group size if needed.
             hrow[24 + r] = sess[(size_t) rows[r].slot].rdelta;
             pmax = std::max<int64_t>(pmax, rows[r].cell);
             /*
-            DPCT1124:134: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:136: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
@@ -4940,28 +5246,28 @@ work-group size if needed.
                                            rows[r].seed, (size_t)N * 4)));
         }
         /*
-        DPCT1124:135: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:137: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hrow, (size_t)T * 4)));
         /*
-        DPCT1124:136: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:138: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(d_rcell, hrow + 8, (size_t)T * 4)));
         /*
-        DPCT1124:137: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:139: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(d_rslot, hrow + 16, (size_t)T * 4)));
         /*
-        DPCT1124:138: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:140: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -4985,7 +5291,7 @@ work-group size if needed.
                     auto N_ct4 = 2 * N;
                     auto m_eps_ct6 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_6804c2>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_f9b66f>>(
                         sycl::nd_range<3>(sycl::range(1, 1, T) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -5006,7 +5312,7 @@ work-group size if needed.
                     auto N_ct4 = 2 * N;
                     auto m_eps_ct6 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_93948b>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_rms_ld_8f5234>>(
                         sycl::nd_range<3>(sycl::range(1, 1, T) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -5027,7 +5333,7 @@ work-group size if needed.
                     auto h_ct2 = h;
                     auto m_eps_ct4 = m->eps;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_rms_fb3056>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_rms_703f70>>(
                         sycl::nd_range<3>(sycl::range(1, 1, T) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -5049,7 +5355,7 @@ work-group size if needed.
                     auto amv_ct3 = amv;
                     auto ami_ct4 = ami;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_argmax_bd3a61>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_argmax_eb9fee>>(
                         sycl::nd_range<3>(sycl::range(1, T, kArgBlocks) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -5070,7 +5376,7 @@ work-group size if needed.
                     auto amv_ct3 = amv;
                     auto ami_ct4 = ami;
 
-                    cgh.parallel_for<dpct_kernel_name<class k_argmax_fb098a>>(
+                    cgh.parallel_for<dpct_kernel_name<class k_argmax_751e1b>>(
                         sycl::nd_range<3>(sycl::range(1, T, 1) *
                                               sycl::range(1, 1, kThreads),
                                           sycl::range(1, 1, kThreads)),
@@ -5084,7 +5390,7 @@ work-group size if needed.
         rows_deferred = false;
         rows_mode = false;
         /*
-        DPCT1124:139: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:141: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -5097,7 +5403,7 @@ work-group size if needed.
     void host_logits_row(int r, std::vector<float> &out) try {
         out.resize((size_t) m->g.n_vocab);
         /*
-        DPCT1124:140: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:142: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -5121,11 +5427,12 @@ work-group size if needed.
         const Sess& a = sess[(size_t) src];
         Sess& b = sess[(size_t) dst];
         const size_t C = (size_t) g.ssm_conv_channels;
-        const size_t row = (size_t) ctx * g.head_dim * 4;
+        const size_t row = (size_t) ctx * g.head_dim * (kv_q8 ? 1 : 2);   // a cache cell's row: int8 codes, or FP16
+        const size_t srow = (size_t) ctx * (g.head_dim / KV_Q8_GROUP) * 2;   // q8: its row of FP16 scales
         for (size_t l = 0; l < a.conv.size(); ++l) {
             if (a.conv[l]) {
                 /*
-                DPCT1124:141: cudaMemcpyAsync is migrated to asynchronous memcpy
+                DPCT1124:143: cudaMemcpyAsync is migrated to asynchronous memcpy
                 API. While the origin API might be synchronous, it depends on
                 the type of operand memory, so you may need to call wait() on
                 event return by memcpy API to ensure synchronization behavior.
@@ -5133,7 +5440,7 @@ work-group size if needed.
                 CK(DPCT_CHECK_ERROR(st->memcpy(b.conv[l], a.conv[l],
                                                C * (g.ssm_d_conv - 1) * 4)));
                 /*
-                DPCT1124:142: cudaMemcpyAsync is migrated to asynchronous memcpy
+                DPCT1124:144: cudaMemcpyAsync is migrated to asynchronous memcpy
                 API. While the origin API might be synchronous, it depends on
                 the type of operand memory, so you may need to call wait() on
                 event return by memcpy API to ensure synchronization behavior.
@@ -5144,30 +5451,54 @@ work-group size if needed.
                                    g.ssm_state_size * 4)));
             }
             if (a.kc[l] && a.pos > 0) {
+                const size_t w = (size_t) a.pos * g.head_dim * (kv_q8 ? 1 : 2);
                 /*
-                DPCT1124:143: cudaMemcpy2DAsync is migrated to asynchronous
+                DPCT1124:145: cudaMemcpy2DAsync is migrated to asynchronous
                 memcpy API. While the origin API might be synchronous, it
                 depends on the type of operand memory, so you may need to call
                 wait() on event return by memcpy API to ensure synchronization
                 behavior.
                 */
                 CK(DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
-                    b.kc[l], row, a.kc[l], row, (size_t)a.pos * g.head_dim * 4,
-                    (size_t)g.n_head_kv, dpct::device_to_device, *(st))));
+                    b.kc[l], row, a.kc[l], row, w, (size_t)g.n_head_kv,
+                    dpct::device_to_device, *(st))));
                 /*
-                DPCT1124:144: cudaMemcpy2DAsync is migrated to asynchronous
+                DPCT1124:146: cudaMemcpy2DAsync is migrated to asynchronous
                 memcpy API. While the origin API might be synchronous, it
                 depends on the type of operand memory, so you may need to call
                 wait() on event return by memcpy API to ensure synchronization
                 behavior.
                 */
                 CK(DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
-                    b.vc[l], row, a.vc[l], row, (size_t)a.pos * g.head_dim * 4,
-                    (size_t)g.n_head_kv, dpct::device_to_device, *(st))));
+                    b.vc[l], row, a.vc[l], row, w, (size_t)g.n_head_kv,
+                    dpct::device_to_device, *(st))));
+                if (kv_q8) {   // the scales ride alongside the codes
+                    const size_t sw = (size_t) a.pos * (g.head_dim / KV_Q8_GROUP) * 2;
+                    /*
+                    DPCT1124:147: cudaMemcpy2DAsync is migrated to asynchronous
+                    memcpy API. While the origin API might be synchronous, it
+                    depends on the type of operand memory, so you may need to
+                    call wait() on event return by memcpy API to ensure
+                    synchronization behavior.
+                    */
+                    CK(DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
+                        b.ksc[l], srow, a.ksc[l], srow, sw, (size_t)g.n_head_kv,
+                        dpct::device_to_device, *(st))));
+                    /*
+                    DPCT1124:148: cudaMemcpy2DAsync is migrated to asynchronous
+                    memcpy API. While the origin API might be synchronous, it
+                    depends on the type of operand memory, so you may need to
+                    call wait() on event return by memcpy API to ensure
+                    synchronization behavior.
+                    */
+                    CK(DPCT_CHECK_ERROR(dpct::async_dpct_memcpy(
+                        b.vsc[l], srow, a.vsc[l], srow, sw, (size_t)g.n_head_kv,
+                        dpct::device_to_device, *(st))));
+                }
             }
         }
         /*
-        DPCT1124:145: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:149: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -5208,14 +5539,14 @@ work-group size if needed.
         hpin[16 + fix.size()] = x_tok;
         hpin[1] = (int32_t) (pos - (int64_t) fix.size());
         /*
-        DPCT1124:146: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:150: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin + 16, (size_t)T0 * 4)));
         /*
-        DPCT1124:147: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:151: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -5225,7 +5556,7 @@ work-group size if needed.
         float* seeds = mtp_seed();
         if (!fix.empty())
             /*
-            DPCT1124:148: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:152: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
@@ -5233,7 +5564,7 @@ work-group size if needed.
             CK(DPCT_CHECK_ERROR(
                 st->memcpy(seeds, hmain, fix.size() * (size_t)N * 4)));
         /*
-        DPCT1124:149: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:153: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -5244,7 +5575,7 @@ work-group size if needed.
         drafts.assign((size_t) D, 0);
         if (D > 0) {
             /*
-            DPCT1124:150: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:154: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
@@ -5258,21 +5589,21 @@ work-group size if needed.
             hpin[0] = drafts[(size_t) d - 1];
             hpin[1] = (int32_t) (pos + d);
             /*
-            DPCT1124:151: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:155: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
             */
             CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin, 4)));
             /*
-            DPCT1124:152: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:156: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
             */
             CK(DPCT_CHECK_ERROR(st->memcpy(pos0_m, hpin + 1, 4)));
             /*
-            DPCT1124:153: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:157: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
@@ -5283,7 +5614,7 @@ work-group size if needed.
             if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
             else forward_mtp(1, pos + d, seeds, true, false);
             /*
-            DPCT1124:154: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:158: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
@@ -5298,14 +5629,14 @@ work-group size if needed.
         for (int d = 0; d < D; ++d) hpin[17 + d] = drafts[(size_t) d];
         hpin[1] = (int32_t) pos;
         /*
-        DPCT1124:155: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:159: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(tok, hpin + 16, (size_t)T * 4)));
         /*
-        DPCT1124:156: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:160: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -5315,7 +5646,7 @@ work-group size if needed.
         graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
         rows_deferred = false;
         /*
-        DPCT1124:157: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:161: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -5328,7 +5659,7 @@ work-group size if needed.
         for (int i = 0; i <= a; ++i) picks[i] = hpin[2 + i];
         commit(a + 1);
         /*
-        DPCT1124:158: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:162: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -5370,7 +5701,7 @@ work-group size if needed.
 
     int greedy() try {
         /*
-        DPCT1124:159: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:163: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -5387,7 +5718,7 @@ work-group size if needed.
     void host_logits(std::vector<float> &out) try {
         out.resize((size_t) m->g.n_vocab);
         /*
-        DPCT1124:160: cudaMemcpyAsync is migrated to asynchronous memcpy API.
+        DPCT1124:164: cudaMemcpyAsync is migrated to asynchronous memcpy API.
         While the origin API might be synchronous, it depends on the type of
         operand memory, so you may need to call wait() on event return by memcpy
         API to ensure synchronization behavior.
@@ -5424,7 +5755,7 @@ bool place_experts(Model &m, Engine &E, double vram_gib, int threads,
     }
     size_t fr = 0, tot = 0;
     /*
-    DPCT1106:161: 'cudaMemGetInfo' was migrated with the Intel extensions for
+    DPCT1106:165: 'cudaMemGetInfo' was migrated with the Intel extensions for
     device information which may not be supported by all compilers or runtimes.
     You may need to adjust the code.
     */
@@ -5453,7 +5784,7 @@ bool place_experts(Model &m, Engine &E, double vram_gib, int threads,
         m.packed.clear();
         E.reset_graphs();
         /*
-        DPCT1106:162: 'cudaMemGetInfo' was migrated with the Intel extensions
+        DPCT1106:166: 'cudaMemGetInfo' was migrated with the Intel extensions
         for device information which may not be supported by all compilers or
         runtimes. You may need to adjust the code.
         */
@@ -5481,7 +5812,7 @@ bool place_experts(Model &m, Engine &E, double vram_gib, int threads,
         } else if (total_main + ((size_t) 64 << 20) <= room) {
             E.shrink_att((size_t) 16 << 20);
             /*
-            DPCT1106:163: 'cudaMemGetInfo' was migrated with the Intel
+            DPCT1106:167: 'cudaMemGetInfo' was migrated with the Intel
             extensions for device information which may not be supported by all
             compilers or runtimes. You may need to adjust the code.
             */
@@ -5567,16 +5898,16 @@ bool place_experts(Model &m, Engine &E, double vram_gib, int threads,
     migrated code and was removed or replaced with 0. You may need to check the
     migrated code.
     */
-    // SYCL port: cudaHostAlloc answered with an error code; SYCL's malloc_host answers with a null pointer (the
-    // Level Zero driver refuses a pinned allocation of this size without setting one - the A750's few-GB limit), and
-    // `pinned` was then true with nothing to pin into, and the first expert's memset segfaulted.  A refused
-    // allocation is exactly what the pageable fallback below is for.
-    arena = (uint8_t *)strata::malloc_host_guarded(host, q_ct1);
-    const bool pinned = arena != nullptr;
+    bool pinned = DPCT_CHECK_ERROR(
+                      arena = (uint8_t *)sycl::malloc_host(host, q_ct1)) == 0;
     if (!pinned) {
+        /*
+        DPCT1010:168: SYCL uses exceptions to report errors and does not use the
+        error codes. The cudaGetLastError function call was replaced with 0. You
+        need to rewrite this code.
+        */
+        (void)0;
         arena = (uint8_t*) std::malloc(host);
-        std::fprintf(stderr, "strata-q36: the experts' host arena (%.1f MiB) is pageable, not pinned: the driver would "
-                             "not pin an allocation that size\n", (double) host / 1048576.0);
         if (!arena) {
             err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
             return false;
@@ -5602,10 +5933,6 @@ bool place_experts(Model &m, Engine &E, double vram_gib, int threads,
             }
             L.n_slots = (int) ne;
             continue;
-        }
-        if (!arena) {   // SYCL port: the two allocations above can both come back null on a driver that caps one
-            err = "no host memory for the experts (" + std::to_string(host >> 20) + " MiB)";
-            return false;
         }
         L.hblobs = arena + off;
         off += L.stride * (size_t) ne + kMmqTail;
@@ -5683,7 +6010,7 @@ bool place_experts(Model &m, Engine &E, double vram_gib, int threads,
     CK(DPCT_CHECK_ERROR(E.ev_route = new sycl::event()));
     if (staging) {
         /*
-        DPCT1025:165: The SYCL queue is created ignoring the flag and priority
+        DPCT1025:169: The SYCL queue is created ignoring the flag and priority
         options.
         */
         CK(DPCT_CHECK_ERROR(E.cst = dev_ct1.create_queue(true)));
@@ -5695,12 +6022,12 @@ bool place_experts(Model &m, Engine &E, double vram_gib, int threads,
             CK(DPCT_CHECK_ERROR(E.ev_copy[b] = new sycl::event()));
             CK(DPCT_CHECK_ERROR(E.ev_used[b] = new sycl::event()));
             /*
-            DPCT1012:166: Detected kernel execution time measurement pattern and
+            DPCT1012:170: Detected kernel execution time measurement pattern and
             generated an initial code for time measurements in SYCL. You can
             change the way time is measured depending on your goals.
             */
             /*
-            DPCT1024:167: The original code returned the error code that was
+            DPCT1024:171: The original code returned the error code that was
             further consumed by the program logic. This original code was
             replaced with 0. You may need to rewrite the program logic consuming
             the error code.
@@ -6039,7 +6366,7 @@ struct Serve {
             Engine::Sess& ss = E.sess[(size_t) b];
             const int r0 = row0[(size_t) i];
             /*
-            DPCT1124:168: cudaMemcpyAsync is migrated to asynchronous memcpy
+            DPCT1124:172: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
@@ -6109,7 +6436,7 @@ struct Serve {
             Engine::Sess& ss = E.sess[(size_t) b];
             if (E.bmtp)   // (the hidden state a later first proposal starts from)
                 /*
-                DPCT1124:169: cudaMemcpyAsync is migrated to asynchronous memcpy
+                DPCT1124:173: cudaMemcpyAsync is migrated to asynchronous memcpy
                 API. While the origin API might be synchronous, it depends on
                 the type of operand memory, so you may need to call wait() on
                 event return by memcpy API to ensure synchronization behavior.
@@ -6293,7 +6620,7 @@ struct Serve {
         bool cancelled = false;
         const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
             /*
-            DPCT1040:49: Use sycl::stream instead of printf if your code is used
+            DPCT1040:50: Use sycl::stream instead of printf if your code is used
             on the device.
             */
             std::printf("PP %lld %lld %.0f %.1f\n", (long long)done,
@@ -6383,7 +6710,7 @@ struct Serve {
             }
             auto emit = [&](int t) {   // false: the answer ends here
                 /*
-                DPCT1040:50: Use sycl::stream instead of printf if your code is
+                DPCT1040:51: Use sycl::stream instead of printf if your code is
                 used on the device.
                 */
                 std::printf("T %d\n", t);
@@ -6494,6 +6821,7 @@ int strata::qwen35::run(int argc, char** argv) {
     std::string model, tokens, force, dump_full, emb_file;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
+    bool kv_q8 = false;
     bool warm = true;
     int expert_slots = 0, batch = 0, draft_vocab = -1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
@@ -6535,6 +6863,7 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
         else if (a == "--batch-mtp") batch_mtp = true;                                  // ... each verifying an MTP proposal
         else if (a == "--expert-vram") expert_vram = std::atof(next().c_str());   // GiB for the routed experts
+        else if (a == "--kv-q8") kv_q8 = true;   // int8 K / V cache, an FP16 scale per 64 dims (FP16 without it)
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
@@ -6547,7 +6876,7 @@ int strata::qwen35::run(int argc, char** argv) {
             if (val) ++i;
         } else {
             std::fprintf(stderr,
-                         "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
+                         "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--kv-q8] [--no-graph]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
             return 2;
@@ -6575,12 +6904,13 @@ int strata::qwen35::run(int argc, char** argv) {
     }
     Engine E;
     E.use_graph = graph;
+    E.kv_q8 = kv_q8;
     if (chunk == 0) {
         // auto: the largest chunk (4096 .. 1024) that fits beside every expert in VRAM; 2048 when they will not all fit (a prompt chunk streams every layer's
         // experts over PCIe once, so a bigger chunk pays that once for more tokens)
         size_t fr = 0, tot = 0, experts = 0;
         /*
-        DPCT1106:170: 'cudaMemGetInfo' was migrated with the Intel extensions
+        DPCT1106:174: 'cudaMemGetInfo' was migrated with the Intel extensions
         for device information which may not be supported by all compilers or
         runtimes. You may need to adjust the code.
         */
