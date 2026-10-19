@@ -187,3 +187,64 @@ Both paths run and produce real tokens on the UHD 770; the decode rate is essent
 (8.8-10.2 tok/s) because the iGPU is compute-bound on the expert GEMMs, not on the cache
 bandwidth - the saving shows up in how much context fits, not in tok/s.  Measuring the expert/iGPU
 split that the shared memory bus actually wants is the next piece of work.
+
+## Performance: what the expert split actually costs, and the full 262144 context
+
+Measured on an idle machine (i5-13500, 62 GB, oneAPI 2026.1, `strata-q36`, three bench
+repetitions, the first discarded as warm-up).  **Run benchmarks one at a time**: these numbers
+came out of a first pass where four of them ran together, and the shared memory bus and the
+page cache turned 27 tok/s prompts into 20 and the free-VRAM figure into nonsense (6.68 GiB
+reported where an idle machine reports 28).
+
+### The expert/iGPU split does not move decode
+
+| slots in VRAM (of 256) | CPU pool | pp512 tok/s | tg128 tok/s |
+|---|---|---|---|
+| 64  | 68.8% on GPU | **27.5** | 7.3 |
+| 96  | 74.8%        | **27.5** | 7.2 |
+| 128 | 80.8%        | 27.1     | 7.3 |
+| 160 | 87.5%        | 25.6     | 7.3 |
+| 214 | 95.4%        | 24.8     | 7.3 |
+| all | none         | 24.9     | **7.4** |
+
+Decode is flat: the iGPU is the bottleneck whether the CPU pool takes 5% or 31% of the rows, so
+moving experts between them buys nothing.  The prompt is the other way round - the CPU's AVX2
+helps the big prompt batches, so a few experts on the CPU (64-96 slots) is the best prompt
+throughput, ~10% over all-in-VRAM.  All-in-VRAM needs no CPU pool at all and is the simplest
+setup; the engine's `--expert-cache auto` picks it when the machine is idle and falls back to
+the hybrid when the RAM is busy (that is what the "6.68 GiB free" above was).
+
+### The whole 262144 context fits
+
+Cyber-Tiel's native context is 262144 cells.  With every routed expert in VRAM:
+
+| context | K/V cache | free VRAM after the experts | tg32 tok/s |
+|---|---|---|---|
+| 4096    | FP16 | 9.7 GiB   | 7.4 |
+| 32768   | FP16 | 9.0 GiB   | 7.4 |
+| 131072  | FP16 | 6.5 GiB   | 7.3 |
+| 131072  | q8   | 7.8 GiB   | 7.4 |
+| 262144  | FP16 | 3.0 GiB   | 7.2 |
+| 262144  | **q8** | **5.7 GiB** | 7.3 |
+
+Both formats run at the full 262144; `--kv-q8` leaves ~2.7 GiB more headroom and costs nothing
+in throughput (decode is latency-bound, not bandwidth-bound).  `--kv-q8` is the setting to ship
+for long context.
+
+### What does not help
+
+- `STRATA_GDN_XE=1` (16-lane sub-group GDN): within noise on every shape (24.9 / 7.4 both
+  ways); the Xe recurrence is actually slower at T=1/7/1000 and faster only at T=256.  Leave off.
+- `--no-graph`: the decode graph is essential; without it 512+128 tokens did not finish in
+  seven minutes against ~100 s with it.
+- Dropping `IGC_EnableDPEmulation=1 OverrideDefaultFP64Settings=1`: the run is not faster and
+  the greedy text changes (the rope and QK paths use doubles), so the flags stay.
+
+### Speculative decoding is not usable yet
+
+The MTP block loads and runs (Q3_K experts, `vec_dot_q3_K_q8_1`), but its drafts are rejected
+100% of the time and the chained drafts after the first come back as the no-token sentinel.  The
+first draft is a plausible token id and then the block's own output is garbage, so the bug is in
+the MTP block's forward (its attention or its seed/row handling), not in the expert kernel: a
+direct test of `native_mmvq` on a real `blk.40.ffn_gate_exps.weight` row against a dequantized
+reference agrees to 1.6e-7.  Until that is fixed, run without `--mtp`.
