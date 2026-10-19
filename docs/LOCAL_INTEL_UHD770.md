@@ -154,10 +154,18 @@ measured (UHD 770, i5-13500, 62 GB, oneAPI 2026.1, Level Zero 1.17):
 | prompt, 3 tokens | 269 ms (**11.2 tok/s**) |
 | decode, 8 tokens | 912 ms (**8.8 tok/s**) |
 
-**The answers are NaN.** The engine's own verifier (`STRATA_Q36_VERIFY=1`) says the same: the first
-attention output of layer 0 is already NaN, so it emits the no-token sentinel. This is "it runs",
-not "it is right" - the numerics are the next piece of work, and the suspects are in the migrated
-attention kernels (`k_attn_prep` / `k_attn_part` / `k_attn_merge`) and the K-quant expert kernels.
+**The answers are real now.** The NaN was not in any kernel: `upload_f32` (the f32 weight uploader)
+returned the device pointer before dpct's asynchronous `memcpy` finished, so the GDN layer's
+`ssm_dt.bias` / `ssm_a` (32 floats each) were read as 8.4e-45 and the state step overflowed. One
+`.wait()` on the memcpy fixes it; the model now emits real tokens:
+
+  prompt 3 tokens in 277 ms (10.8 tok/s), 4 generated in 392 ms (10.2 tok/s)
+  prompt 3 tokens in 277 ms (10.9 tok/s), 16 generated in 1952 ms (8.2 tok/s)
+
+The remaining 300 verify mismatches are the `q8_small` (180) and `shared_gu q8` (120) checks, the
+same FMA-ordering class as the pre-existing `s2_expert_grouped_parity` failure (within 1e-7 of the
+reference, fails on the CPU SYCL build too). Parity suite: 31/34, unchanged from the pre-existing
+three (`iq_parity`, `ple_parity`, `s2_expert_grouped_parity`).
 
 Flags the port added on the way:
 
