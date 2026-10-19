@@ -259,9 +259,6 @@ auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NC][32]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const int warp = item_ct1.get_local_id(2) >> 5,
               lane = item_ct1.get_local_id(2) & 31;
-    // SYCL port: one row per warp, so a block covers as many rows as it has warps.  The 32 here was the
-    // 1024-thread block's warp count; a consumer GPU's 512-thread block has 16 and the grid is sized for that
-    // (see the launch), so the row index has to come from the block's own width or half the rows are never written.
     const int row =
         item_ct1.get_group(2) * (item_ct1.get_local_range(2) >> 5) + warp;
     float rg[NC], ru[NC];
@@ -274,7 +271,7 @@ auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NC][32]>(
             u[c][warp] = ru[c];
         }
     /*
-    DPCT1065:53: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:54: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -284,7 +281,7 @@ auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NC][32]>(
         for (int c = 0; c < NC; ++c) {
             const float gi = g[c][lane];
             /*
-            DPCT1013:52: The rounding mode could not be specified and the
+            DPCT1013:53: The rounding mode could not be specified and the
             generated code may have different accuracy than the original code.
             Verify the correctness. SYCL math built-in function rounding mode is
             aligned with OpenCL C 1.2 standard.
@@ -314,7 +311,7 @@ auto &sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[256]>(
     }
     sh[item_ct1.get_local_id(2)] = s;
     /*
-    DPCT1065:54: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:55: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -328,7 +325,7 @@ auto &sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[256]>(
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:55: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:56: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -337,7 +334,7 @@ auto &sh = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[256]>(
     const float r = sycl::rsqrt(sh[0] / (float)n + eps);
     for (int i = item_ct1.get_local_id(2); i < n; i += 256) {
         /*
-        DPCT1013:56: The rounding mode could not be specified and the generated
+        DPCT1013:57: The rounding mode could not be specified and the generated
         code may have different accuracy than the original code. Verify the
         correctness. SYCL math built-in function rounding mode is aligned with
         OpenCL C 1.2 standard.
@@ -377,7 +374,7 @@ auto &vv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2048]>(
                               : t * K_ + item_ct1.get_local_id(2)) *
                     n;
     /*
-    DPCT1065:57: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:58: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -396,7 +393,7 @@ auto &vv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2048]>(
     }
     if (wn == nullptr) return;
     /*
-    DPCT1065:58: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:59: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -409,7 +406,7 @@ auto &vv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2048]>(
         sh[item_ct1.get_local_id(2)] = s;
     }
     /*
-    DPCT1065:59: Consider replacing sycl::nd_item::barrier() with
+    DPCT1065:60: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
     performance if there is no access to global memory.
     */
@@ -423,7 +420,7 @@ auto &vv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2048]>(
         converged control flow. You may need to adjust the code.
         */
         /*
-        DPCT1065:60: Consider replacing sycl::nd_item::barrier() with
+        DPCT1065:61: Consider replacing sycl::nd_item::barrier() with
         sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
         better performance if there is no access to global memory.
         */
@@ -432,7 +429,7 @@ auto &vv = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[2048]>(
     const float r = sycl::rsqrt(sh[0] / (float)n + eps);
     for (int i = item_ct1.get_local_id(2); i < n; i += item_ct1.get_local_range(2)) {
         /*
-        DPCT1013:61: The rounding mode could not be specified and the generated
+        DPCT1013:62: The rounding mode could not be specified and the generated
         code may have different accuracy than the original code. Verify the
         correctness. SYCL math built-in function rounding mode is aligned with
         OpenCL C 1.2 standard.
