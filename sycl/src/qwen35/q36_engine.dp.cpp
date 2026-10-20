@@ -4181,6 +4181,9 @@ work-group size if needed.
     /// the most frequent ones).  A draft only proposes: the verify window decides, so a token outside the subset is a
     /// rejected draft and nothing else - the answer is the plain greedy answer whatever draft_n is.  0 = the whole vocabulary.
     int draft_n = 0;
+    // spec_step timing (STRATA_Q36_SPEC_TIME): [0] MTP forwards+heads, [1] verify window, [2] queue waits
+    double sp_t[3] = {0, 0, 0};
+    long long sp_steps = 0, sp_drafts = 0, sp_taken = 0;
     void head_draft(const float* hn) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
@@ -5531,6 +5534,7 @@ work-group size if needed.
     /// hand-over of a stopped request to a batch slot) reuses it instead of reading them again.
     int spec_step(int x_tok, const std::vector<int32_t>& fix, int D, std::vector<int32_t>& drafts, int32_t* picks,
                   const std::atomic<bool>* cancel = nullptr) {
+        const auto tsp0 = Clock::now();
         const int N = (int) m->g.n_embd;
         if (main_hybrid) D = std::min<int>(D, (int) (kRebalanceEvery - pos % kRebalanceEvery) - 1);
         const int T0 = (int) fix.size() + 1;   // the redo rows and the row of x
@@ -5572,7 +5576,8 @@ work-group size if needed.
         */
         CK(DPCT_CHECK_ERROR(
             st->memcpy(seeds + fix.size() * (size_t)N, hlast, (size_t)N * 4)));
-        forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
+        { const auto t = Clock::now(); forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
+          sp_t[0] += ms_since(t); }
         drafts.assign((size_t) D, 0);
         if (D > 0) {
             /*
@@ -5582,7 +5587,7 @@ work-group size if needed.
             return by memcpy API to ensure synchronization behavior.
             */
             CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 2, pick_m, 4)));
-            CK(DPCT_CHECK_ERROR(st->wait()));
+            { const auto t = Clock::now(); CK(DPCT_CHECK_ERROR(st->wait())); sp_t[2] += ms_since(t); }
             drafts[0] = hpin[2];
         }
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
@@ -5612,8 +5617,10 @@ work-group size if needed.
             CK(DPCT_CHECK_ERROR(
                 st->memcpy(seeds, hmtp + (size_t)last_row * N, (size_t)N * 4)));
             last_row = 0;
-            if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
-            else forward_mtp(1, pos + d, seeds, true, false);
+            { const auto t = Clock::now();
+              if (mtp_graph) graph_run(gs().gm1, [&] { forward_mtp(1, pos + d, seeds, true, use_graph); });
+              else forward_mtp(1, pos + d, seeds, true, false);
+              sp_t[0] += ms_since(t); }
             /*
             DPCT1124:158: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
@@ -5621,7 +5628,7 @@ work-group size if needed.
             return by memcpy API to ensure synchronization behavior.
             */
             CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 2, pick_m, 4)));
-            CK(DPCT_CHECK_ERROR(st->wait()));
+            { const auto t = Clock::now(); CK(DPCT_CHECK_ERROR(st->wait())); sp_t[2] += ms_since(t); }
             drafts[(size_t) d] = hpin[2];
         }
         // the verify window
@@ -5644,7 +5651,9 @@ work-group size if needed.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(pos0, hpin + 1, 4)));
         rows_deferred = true;
-        graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
+        { const auto t = Clock::now();
+          graph_run(gs().gv[T], [&] { forward(T, pos, T, use_graph, true); });
+          sp_t[1] += ms_since(t); }
         rows_deferred = false;
         /*
         DPCT1124:161: cudaMemcpyAsync is migrated to asynchronous memcpy API.
@@ -5653,7 +5662,7 @@ work-group size if needed.
         API to ensure synchronization behavior.
         */
         CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 2, pick, (size_t)T * 4)));
-        CK(DPCT_CHECK_ERROR(st->wait()));
+        { const auto t = Clock::now(); CK(DPCT_CHECK_ERROR(st->wait())); sp_t[1] += ms_since(t); }
         int a = 0;
         while (a < D && hpin[2 + a] == drafts[(size_t) a]) ++a;
         if (cancel != nullptr && cancel->load()) a = 0;
@@ -5669,6 +5678,13 @@ work-group size if needed.
             st->memcpy(hlast, hmain + (size_t)a * N, (size_t)N * 4)));
         pos += a + 1;
         after_rows(a + 1);
+        ++sp_steps; sp_drafts += D; sp_taken += a;
+        if (std::getenv("STRATA_Q36_SPEC_TIME")) {
+            static double wall = 0;
+            wall += ms_since(tsp0);
+            std::fprintf(stderr, "spectime step %lld: mtp %.1f verify %.1f wait %.1f | totals mtp %.0f verify %.0f wait %.0f wall %.0f\n",
+                         sp_steps, sp_t[0], sp_t[1], sp_t[2], sp_t[0], sp_t[1], sp_t[2], wall);
+        }
         return a;
     }
 
