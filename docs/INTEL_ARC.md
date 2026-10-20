@@ -59,10 +59,25 @@ An iGPU has no VRAM of its own, so:
 
 **What this costs.** The GPU is the small part: on a UHD 770 the engine keeps under 4 GiB of experts (the driver's cap
 on a single allocation, which `--expert-cache auto` now respects) and the CPU computes the rest, so the speed is a CPU
-number with the dense projections, the attention and the sampling offloaded to the iGPU. The 50-kernel parity suite
-passes on a UHD 770 except `gr_parity`'s fused q8_1 path (not built for the port), `iq_parity`'s Q3_K multi-column
-mmvq and `s2_expert_grouped_parity` (both known port items). End-to-end decode on an iGPU is **not measured yet** -
-that needs a Flash-Next download on the machine, and the 35B `qwen35moe` family is CUDA/HIP only.
+number with the dense projections, the attention and the sampling offloaded to the iGPU. When the RAM is large enough
+for the whole model the experts stay on the GPU and the CPU is not used. The parity suite passes on a UHD 770
+**32 of 35**; the three that do not are `iq_parity`'s Q3_K multi-column mmvq (`dequant` is exact, the multi-column
+sums run in a different order), `ple_parity` (needs the 28.8 GB shard-2 fixture) and `s2_expert_grouped_parity`
+(FMA order).
+
+**Measured end to end** on a UHD 770 (i5-13500, 62 GB of RAM, Fedora 44, oneAPI 2026.1, all 256 experts in device
+memory): Cyber-Tiel-Coder-35B-A3B (`qwen35moe`, UD-Q4_K_XL, 22.7 GiB) decodes at **8.2 tok/s** and processes a prompt
+at **24.9 tok/s** with `--kv-q8` and a 262144-token context. `--mtp 1 --draft-vocab 65536` adds the model's
+speculative block: **8.8 tok/s**, 88% of drafts accepted, and the same tokens as plain greedy. A layer ablation puts
+51-64% of a step in the routed experts, which run at ~10.5 GB/s against the 31 GB/s the dense projections reach; that
+is the next lever, and it is why the totals are where they are.
+
+The 35B `qwen35moe` family (Cyber-Tiel, Qwen3.6-35B-A3B) runs on Intel through the port's own copy of its engine
+(`sycl/src/qwen35/`), which `strata` selects for a `qwen35moe` model; the numbers above are that path, and
+`strata-q36` is its standalone entry point. The fast paths behind them are the ones this port measured: the
+multi-column Q8_0 MMVQ (2.1-2.9x at 2-8 columns, bitwise identical to the one-column calls), the grouped Q3_K
+expert dot (the port's `QI3_K` was 8 where ggml's is 16, so the dot unpacked the block wrongly), and the shared
+expert's separate products in place of the fused kernel (7.7 -> 8.1 tok/s: the fused kernel's grid is 16 blocks).
 
 **Not supported:** an iGPU that the Level Zero runtime does not list (`sycl-ls` shows nothing), and Windows.
 
@@ -81,8 +96,8 @@ that needs a Flash-Next download on the machine, and the 35B `qwen35moe` family 
   The HIP build is not affected (the option is off by default).
 
 **Not tested by anyone yet:** Windows (no native build path; see below), Arc on WSL2 for the 0.1.39 port, the Alchemist
-A-series, and images (not wired on Intel). Integrated GPUs are described above: they run and their kernel parity is
-measured, but no end-to-end decode number exists yet.
+A-series, and images (not wired on Intel). Integrated GPUs are described above: they run, their kernel parity is
+measured, and a 35B `qwen35moe` model now has an end-to-end number on one.
 
 ## What you need
 
