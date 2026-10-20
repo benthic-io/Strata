@@ -306,6 +306,23 @@ even *perfect* acceptance only reaches ~1.05x today.  That fixes the priority or
 
 1. **Make small-batch verification efficient** (445 -> ~170 ms at the bandwidth floor).  This is
    also what limits plain decode (130 vs ~89 ms) and prompt chunks, so it pays twice.
+
+   The microbenchmarks put the cause on the multi-column dense projection.  A 2048x2048 Q8_0
+   matrix (4.46 MB, the shape every attention/GDN projection has) through `native_mmvq`:
+
+   | ncols | ms | per column | weight bandwidth |
+   |---|---|---|---|
+   | 1 | 0.158 | 0.158 | 28.3 GB/s |
+   | 2 | 0.199 | 0.100 | 22.4 GB/s |
+   | 4 | 0.334 | 0.084 | 13.4 GB/s |
+   | 8 | 0.652 | 0.082 | 6.8 GB/s |
+
+   The kernel amortises the weight read only ~2x from 1 to 8 columns; per-column time halves and
+   then stops.  At the verify window's 5 columns it runs at **11 GB/s of weight traffic** against
+   the 35 GB/s the memory can do, and that is the 445 ms.  The obvious alternative, the fp16 GEMM
+   (`Gemm::native`), is **4x slower** at these sizes (T=5: 1.49 ms against 0.40 ms), so the fix has
+   to be a better multi-column MMVQ, not a path switch.  The same kernel sets pp512 (ncols 8,
+   6.8 GB/s), so improving it pays on prompts too.
 2. **`--draft-vocab N`**: the draft's head is the full 0.54 GB Q8_0 output matrix, ~19 ms per
    draft.  With `--draft-vocab 65536` the step's wait total fell from 930 to 671 ms over 12 steps
    (the drafts are then ~5 ms), at the risk of only drafting low ids - a draft is only a proposal,
