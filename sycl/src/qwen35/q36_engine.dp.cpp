@@ -2743,7 +2743,12 @@ struct Engine {
     sycl::queue &q_ct1 = dev_ct1.in_order_queue();
         const int FS = (int) m->g.n_ff_shexp;
         const Mat &a = L.sh_gate, &b = L.sh_up;
-        if (!fast_k || T < 1 || T > 4 || a.type != 8 || b.type != 8 || a.n_in != b.n_in || a.n_out != FS || b.n_out != FS ||
+        // Off by default on SYCL: the fused kernel's grid is n_out/32 blocks (16 for the 512-row shared expert), which
+        // leaves most of this iGPU idle - a decode step measured 8.1 tok/s through the separate products against 7.7
+        // through this kernel (STRATA_Q36_SHARED_GU=1).  It also rounds the q8_1 image differently from
+        // native_swiglu_quantize_q8_1, so the separate path is the one that matches STRATA_Q36_OLD_KERNELS bit for bit.
+        static const bool sh_gu = std::getenv("STRATA_Q36_SHARED_GU") != nullptr;
+        if (!sh_gu || !fast_k || T < 1 || T > 4 || a.type != 8 || b.type != 8 || a.n_in != b.n_in || a.n_out != FS || b.n_out != FS ||
             a.n_in % 32 != 0 || a.n_in / 32 > 64 || a.n_in / 32 <= 32 || FS % 32 != 0 ||
             (K::native_q8_0_packed_eligible(a.n_in, a.n_out) && K::native_q8_0_packed_enabled()))
             return false;

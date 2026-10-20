@@ -246,9 +246,8 @@ for long context.
 
 | run | tok/s | acceptance |
 |---|---|---|
-| plain | 7.8 | - |
-| `--mtp 1 --draft-vocab 65536` | **8.1** | 28/35 (80%) |
-| `--mtp 1 --draft-vocab 65536`, second prompt | 7.9 | 13/18 (72%) |
+| plain | 8.2 | - |
+| `--mtp 1 --draft-vocab 65536` | **8.8** | 30/34 (88%) |
 | `--mtp 2 --draft-vocab 65536` | 7.4 | 67% |
 | `--mtp 3 --draft-vocab 65536` | 6.0 | 51% |
 
@@ -289,15 +288,42 @@ projections through it by default - +2.6% on a plain decode step - with `STRATA_
 restoring the per-row kernel.  It does not change pp512 (24.9 tok/s): a prompt chunk is T > 8 and
 takes the fp16 GEMM, not MMVQ.
 
+### Where a decode step goes: the routed experts, at a third of the bandwidth
+
+Ablation over a 1-, 4- and 32-row forward (temporary profiler, not in the build):
+
+| | pp1 | pp4 | pp32 |
+|---|---|---|---|
+| full | 130 ms | 342 ms | 1871 ms |
+| MoE block removed | 64 | 122 | 703 |
+| **MoE block** | **66 (51%)** | **220 (64%)** | **1168 (62%)** |
+
+At T=1 the routed experts move ~15 MB per layer (8 of 256 experts: Q4_K gate/up, Q5_K down), ~620 MB per
+token, and the block takes ~59 ms - **10.5 GB/s**.  The dense Q8_0 projections reach 31 GB/s on the same
+machine, so the expert path has a 3x headroom, and it is the largest single item in decode, in a verify
+window and in a prompt chunk.  The existing knobs do not close it: `STRATA_GU_LANES` / `STRATA_DOWN_LANES`
+4/8/16/32 give 7.6/7.7/7.0/6.6 tok/s (8 is the default and the best), and upstream's multi-entry kernel
+(`STRATA_EXPERT_SPLIT=1`, one warp per row) is 4.6.  The next step is a grouped-expert kernel that keeps the
+activation in local memory and splits K, not another speculative-decoding tweak.
+
+### The fused shared expert: off by default on this GPU
+
+`shared_gu` computes the shared expert's gate, up, SwiGLU and q8_1 image in one kernel, but its grid is
+`n_out/32` blocks - 16 for the 512-row shared expert - so 16 of the iGPU's 256 EUs do all the work.  The
+separate products (`native_mmvq` for gate/up, then `native_swiglu_quantize_q8_1`) measured 7.7 -> 8.1 tok/s
+on a decode step, and because the fused kernel rounds the q8_1 image differently, the separate path is the
+one that matches `STRATA_Q36_OLD_KERNELS=1` token for token.  It is now opt-in (`STRATA_Q36_SHARED_GU=1`);
+reworking it to 8 rows per block is the way to get the fusion back.
+
 ### What limits MTP, measured
 
 `STRATA_Q36_SPEC_TIME=1` splits a speculative step.  With D=2, 4096 context, all experts in VRAM:
 MTP forwards+heads 21 ms, verify window (3 rows) 293 ms, queue waits 42 ms - 353 ms per step.
 
 A separate probe puts the practical read bandwidth at **35 GB/s** (44 GB/s read+write), and
-`--bench-pp` gives the per-row cost: 1 row 130 ms, 2 rows 107, 4 rows 90, 8 rows 81, 16 rows 80,
-32 rows 58, 512 rows 40.  Decode moves ~3.1 GB per token, so a plain token is already at ~24 GB/s
-(68% of the read bandwidth); a 3-row verify has a ~130 ms bandwidth floor and costs 293 ms.  That
+`--bench-pp` gives the per-row cost: 1 row 130 ms, 2 rows 107, 4 rows 80, 8 rows 70, 32 rows 52,
+512 rows 40.  Decode moves ~3.1 GB per token, so a plain token is already at ~26 GB/s
+(74% of the read bandwidth); a 3-row verify has a ~130 ms bandwidth floor and costs 275 ms.  That
 is why D=1 wins: the second draft's extra row costs more than the draft saves.  The remaining
 headroom is in small-batch verification (2.2x to the floor), and it is the same inefficiency that
 makes 2-16 row chunks cost 80-107 ms per row.
