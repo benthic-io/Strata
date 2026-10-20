@@ -240,20 +240,38 @@ for long context.
 - Dropping `IGC_EnableDPEmulation=1 OverrideDefaultFP64Settings=1`: the run is not faster and
   the greedy text changes (the rope and QK paths use doubles), so the flags stay.
 
-### Speculative decoding is not usable yet
+### Speculative decoding: the block computes now, the draft loop does not
 
-The MTP block now loads and runs (its Q3_K experts go through the new `vec_dot_q3_K_q8_1`), but
-its drafts are still rejected: 0 of 20 on a 12-token prompt and 0 of 124 on a short one, with
-`--mtp 2` and `--mtp 4` alike.  What is ruled out:
+The Q3_K expert kernel was wrong in a way that made the MTP block produce noise (see the section
+below).  With that fixed, the block's own predictions are right: fed a constant prompt it agrees
+with the main model on **507 of 511** rows (it was 0 of 511 before the fix), and the `hmtp` /
+logits / argmax chain is consistent.
 
-- the expert kernel: `native_mmvq` on a real `blk.40.ffn_gate_exps.weight` row agrees with a
-  dequantized reference to 1.6e-7, and the main model's own layers (Q4_K / Q5_K) are unaffected;
-- the head and the argmax: the MTP's `pick_m` equals a host-side argmax of its `logits_m`;
-- the MTP block's forward producing garbage: its `hmtp` is finite with sane magnitudes on every
-  shape measured (T=1, 9, 12, 256).
+The draft loop around it still is not usable.  On real text the first draft is usually wrong, and
+the chained drafts freeze at the same four tokens (598, 11113, 81842, 79874) on every step even
+though `tok_m`, `pos0_m` and the seed all change; with `--mtp 4` that is 0 of 124 accepted and
+1.9 tok/s against 7.9 without.  A debug build that waits on the queue inside the step gets 5 of 40
+(12%), so this is a synchronization/state bug in the MTP path (the block's own K/V or the chained
+seed), not in the expert kernel.  Leave `--mtp` off; the plain greedy decode is unaffected.
 
-What is left is whether the MTP block's *attention* over its own K/V is right, and the chained
-drafts: after the first call the later drafts come back as the no-token sentinel, which means the
-chained `forward_mtp(1, ...)` is being fed a seed it cannot use.  Until that is settled, run
-without `--mtp`: the plain greedy text is unchanged and the decode rate is the same (the MTP
-currently costs about 4x, so nothing is lost by leaving it off).
+### Q3_K: the grouped expert dot was wrong
+
+`vec_dot_q3_K_q8_1` in the SYCL port unpacked Q3_K linearly (`qs[p/4]`, `hmask[p/8]`,
+`scales[p/16]`) with `QI3_K` hardcoded to 8.  ggml's layout is not linear: a 256-value block is two
+128-halves, each in four 2-bit shift groups, the high bit comes from `hmask[l]` bit `4n+j`, and the
+16 six-bit scales index `8n+2j+(l/16)`.  `QI3_K` is `QK_K/(4*QR3_K)` with `QR3_K` 4, i.e. **16**,
+and the per-call unit is 16 values, not 32.
+
+The port now runs llama.cpp's `vecdotq.cuh` MMVQ kernel.  Measured on a real
+`blk.40.ffn_gate_exps.weight` expert, one group and one entry, against `iq_dequant_f32`'s
+dequantised reference:
+
+| stage | before | after |
+|---|---|---|
+| gate | 1.4 rel | **9.2e-8** |
+| up | 1.4 rel | **9.3e-8** |
+| MoE output | 32.5 rel | **7.3e-3** |
+
+The 7.3e-3 is the SwiGLU intermediate's q8_1 rounding; Q4_K/Q5_K measure 5.2e-3 on the same test.
+The dense `native_mmvq` has its own Q3_K kernel and was already right, which is why the error only
+showed in the grouped expert path (the MTP block and any Q3_K-expert model).
