@@ -243,9 +243,10 @@ inline void launch_q8_rows(const void *w, const sycl::half *dpl, const void *x,
     launch_q8_rows_t<NC, NJ, PK>(w, dpl, x, y, nb, n_out, 8, 1024, s);
 }
 
-/// The shared expert's gate and up products and SwiGLU + q8_1 in one launch: 32 rows (one q8_1 block of h) per 1024-thread
-/// block, warp w computing gate row and up row 32 b + w, then warp 0 applying native_swiglu_quantize_q8_1_kernel's body to
-/// the 32 pairs.  Column c of the h image is at hq + c * (n_out / 32).  n_out % 32 == 0.
+/// The shared expert's gate and up products and SwiGLU + q8_1 in one launch: 32 rows (one q8_1 block of h) per 512-thread
+/// block, warp w computing gate rows and up rows 32 b + w and 32 b + w + 16 (the device's work-group limit is 512, half
+/// the CUDA original's 1024), then warp 0 applying native_swiglu_quantize_q8_1_kernel's body to the 32 pairs.  Column c
+/// of the h image is at hq + c * (n_out / 32).  n_out % 32 == 0.
 template <int NC, int NJ, bool PK>
 __dpct_inline__ void
 k_sh_gu(const uint8_t *__restrict__ wg, const sycl::half *__restrict__ dg,
@@ -259,16 +260,20 @@ auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NC][32]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const int warp = item_ct1.get_local_id(2) >> 5,
               lane = item_ct1.get_local_id(2) & 31;
-    const int row =
-        item_ct1.get_group(2) * (item_ct1.get_local_range(2) >> 5) + warp;
-    float rg[NC], ru[NC];
-    q8_row_dot<NC, NJ, PK>(wg, dg, x, row, nb, lane, rg);
-    q8_row_dot<NC, NJ, PK>(wu, du, x, row, nb, lane, ru);
+    const int b = item_ct1.get_group(2), row0 = b * 32 + warp,
+              row1 = row0 + 16;
+    float rg0[NC], ru0[NC], rg1[NC], ru1[NC];
+    q8_row_dot<NC, NJ, PK>(wg, dg, x, row0, nb, lane, rg0);
+    q8_row_dot<NC, NJ, PK>(wu, du, x, row0, nb, lane, ru0);
+    q8_row_dot<NC, NJ, PK>(wg, dg, x, row1, nb, lane, rg1);
+    q8_row_dot<NC, NJ, PK>(wu, du, x, row1, nb, lane, ru1);
     if (lane == 0)
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
-            g[c][warp] = rg[c];
-            u[c][warp] = ru[c];
+            g[c][warp] = rg0[c];
+            u[c][warp] = ru0[c];
+            g[c][warp + 16] = rg1[c];
+            u[c][warp + 16] = ru1[c];
         }
     /*
     DPCT1065:54: Consider replacing sycl::nd_item::barrier() with
