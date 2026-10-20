@@ -254,6 +254,13 @@ though `tok_m`, `pos0_m` and the seed all change; with `--mtp 4` that is 0 of 12
 (12%), so this is a synchronization/state bug in the MTP path (the block's own K/V or the chained
 seed), not in the expert kernel.  Leave `--mtp` off; the plain greedy decode is unaffected.
 
+Even with the loop fixed, the arithmetic on this GPU is unfavourable: a verify window of 5 rows
+costs about five single-token steps (decode here is latency-bound, not batching-bound), and the
+four MTP forwards add the rest.  At the 12% the loop reaches today a spec step produces 1.1 tokens
+for ~5 tokens of work; it would need **60%+ draft acceptance** just to break even, against the 46%
+the block shows on real text even when it computes correctly.  The MTP is a correctness/debugging
+item here, not a performance win.
+
 ### Q3_K: the grouped expert dot was wrong
 
 `vec_dot_q3_K_q8_1` in the SYCL port unpacked Q3_K linearly (`qs[p/4]`, `hmask[p/8]`,
