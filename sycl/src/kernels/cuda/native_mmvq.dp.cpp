@@ -2116,6 +2116,187 @@ bool try_wide32(const void* weights, const void* x_q8_1, float* y, int n_in, int
     }
 }
 
+// ============================ SYCL port: Q8_0 multi-column on row-shared activations ============================
+//
+// The wide32 kernel above reads each activation column once per output ROW: at 8 columns that is ~8x the weight
+// bytes, and on a small integrated GPU the shared-cache traffic, not the weights, sets the time (2048x2048: 0.65 ms
+// at 8 columns against 0.15 ms at 1). Here a work-group stages the NCOLS activation columns in local memory and its
+// 16 warps walk a strided set of output rows, so every staged block is read from global memory once and reused by
+// all the rows the group handles (32 groups stage 0.6 MB instead of 37 MB of repeated reads at 2048x2048; the
+// 4.46 MB matrix goes 0.65 -> 0.22 ms at 8 columns, 6.8 -> 20.0 GB/s).
+//
+// Each row keeps wide32's exact layout: lane = 2*sub + l owns blocks kb = sub, sub+16, ... and the 16 quant bytes
+// at qs + 16*l, accumulates them in that order with the same `d * ds * (float)dot` expression, and reduces with the
+// same 32-lane XOR tree, and the product rounds to float before the accumulator add as it does in wide32's
+// `apply()`. Only where the values are read from changes (local memory instead of global), so every output is
+// bitwise equal to the ncols = 1 path (checked by native_mmvq_q8_parity).
+constexpr int Q8R_WARPS = 16;          // 512 threads: the widest group this GPU takes
+constexpr int Q8R_TILE = 64;           // blocks staged at once (2048-wide rows); SLM = NCOLS * 64 * 36 B
+constexpr int Q8R_TILE_TAIL = 32;      // row bigger than that: stage 32 blocks at a time
+constexpr int Q8R_MAX_GROUPS = 32;     // persistent groups: 4 waves of the 8 resident on a 32-EU part
+
+template <int NCOLS, int NW>
+void native_q8_0_rows_kernel(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x,
+                             float* __restrict__ y, int n_in, int n_out, int ngroups) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int lane = int(item.get_local_id(2)), warp = int(item.get_local_id(1));
+    const int g = int(item.get_group(2));
+    const int bpr = n_in / 32;
+    const int l = lane % 2, sub = lane / 2;
+    auto &slm = *sycl::ext::oneapi::group_local_memory_for_overwrite<sycl::int4[NCOLS][Q8R_TILE][2]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &slmd = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NCOLS][Q8R_TILE]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int tid = warp * WARP + lane;
+    constexpr int NT = NW * WARP;
+    for (int idx = tid; idx < NCOLS * bpr; idx += NT) {
+        const int j = idx / bpr, b = idx % bpr;
+        const Q81Block* xb = x + std::size_t(j) * bpr + b;
+        slm[j][b][0] = ld_q8_16(xb, 0);
+        slm[j][b][1] = ld_q8_16(xb, 1);
+        slmd[j][b] = (float) xb->ds[0];
+    }
+    item.barrier();
+    auto sg = item.get_sub_group();
+    const int row_step = ngroups * NW;
+    for (int row = g * NW + warp; row < n_out; row += row_step) {
+        const Q80Block* wr = w + std::size_t(row) * bpr;
+        float acc[NCOLS] = {};
+        for (int kb = sub; kb < bpr; kb += 16) {
+            const sycl::int4 q = load16_a2(wr[kb].qs + 16 * l);
+            const float d = (float) wr[kb].d;
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) {
+                const sycl::int4 u = slm[j][kb][l];
+                // the product rounds to float before the accumulation add, as in wide32's apply(): this is what
+                // keeps the bits equal (a contracted fma here differs in the last ulp on ~half the outputs)
+                const float t = d * slmd[j][kb] * (float) dp4a4(q, u, 0);
+                acc[j] += t;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            float v = acc[j];
+#pragma unroll
+            for (int o = WARP / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+            if (lane == 0) y[std::size_t(j) * n_out + row] = v;
+        }
+    }
+}
+
+// Rows longer than one Q8R_TILE: 16 rows per group, the tile staged again for each 32-block slice. The row's
+// accumulator crosses the tiles in registers, so the sum order is still kb = sub, sub+16, ... .
+template <int NCOLS, int NW, int TILE>
+void native_q8_0_tile_kernel(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x,
+                             float* __restrict__ y, int n_in, int n_out) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const int lane = int(item.get_local_id(2)), warp = int(item.get_local_id(1));
+    const int row = int(item.get_group(2)) * NW + warp;
+    const bool active = row < n_out;
+    const int bpr = n_in / 32;
+    const int l = lane % 2, sub = lane / 2;
+    auto &slm = *sycl::ext::oneapi::group_local_memory_for_overwrite<sycl::int4[NCOLS][TILE][2]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &slmd = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[NCOLS][TILE]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int tid = warp * WARP + lane;
+    constexpr int NT = NW * WARP;
+    const Q80Block* wr = w + std::size_t(active ? row : 0) * bpr;
+    float acc[NCOLS] = {};
+    for (int kb0 = 0; kb0 < bpr; kb0 += TILE) {
+        for (int idx = tid; idx < NCOLS * TILE; idx += NT) {
+            const int j = idx / TILE, b = idx % TILE;
+            const int kb = kb0 + b;
+            if (kb >= bpr) continue;
+            const Q81Block* xb = x + std::size_t(j) * bpr + kb;
+            slm[j][b][0] = ld_q8_16(xb, 0);
+            slm[j][b][1] = ld_q8_16(xb, 1);
+            slmd[j][b] = (float) xb->ds[0];
+        }
+        item.barrier();
+        if (active) {
+            for (int kb = kb0 + sub; kb < kb0 + TILE && kb < bpr; kb += 16) {
+                const sycl::int4 q = load16_a2(wr[kb].qs + 16 * l);
+                const float d = (float) wr[kb].d;
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) {
+                    const sycl::int4 u = slm[j][kb - kb0][l];
+                    const float t = d * slmd[j][kb - kb0] * (float) dp4a4(q, u, 0);
+                    acc[j] += t;
+                }
+            }
+        }
+        item.barrier();
+    }
+    if (!active) return;
+    auto sg = item.get_sub_group();
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+        float v = acc[j];
+#pragma unroll
+        for (int o = WARP / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+        if (lane == 0) y[std::size_t(j) * n_out + row] = v;
+    }
+}
+
+// 512-thread groups and Q8R_TILE * NCOLS * 36 bytes of local memory: query once, fall back to wide32 if the
+// device cannot take them (nothing measured uses less, and the fallback is the old path, not a slower new one).
+inline bool q8r_available(dpct::queue_ptr s) {
+    static const bool v = [s] {
+        const auto dev = s->get_device();
+        return dev.get_info<sycl::info::device::max_work_group_size>() >= std::size_t(Q8R_WARPS * WARP) &&
+               dev.get_info<sycl::info::device::local_mem_size>() >=
+                   std::size_t(8 * Q8R_TILE * 36 + 8 * Q8R_TILE * 4);
+    }();
+    return v;
+}
+
+template <int NCOLS>
+void launch_q8_0_rows(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
+    const auto* w = static_cast<const Q80Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const int bpr = n_in / 32;
+    const unsigned blocks = unsigned((std::size_t(n_out) + Q8R_WARPS - 1) / Q8R_WARPS);
+    const sycl::range<3> t(1, Q8R_WARPS, WARP);
+    if (bpr <= Q8R_TILE) {
+        const int ngroups = int(std::min<std::size_t>(blocks, Q8R_MAX_GROUPS));
+        s->parallel_for<dpct_kernel_name<class native_mmvq_q8_rows, dpct_kernel_scalar<NCOLS>>>(
+            sycl::nd_range<3>(sycl::range(1, 1, std::size_t(ngroups)) * t, t),
+            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                native_q8_0_rows_kernel<NCOLS, Q8R_WARPS>(w, x, y, n_in, n_out, ngroups);
+            });
+        return;
+    }
+    s->parallel_for<dpct_kernel_name<class native_mmvq_q8_tile, dpct_kernel_scalar<NCOLS>>>(
+        sycl::nd_range<3>(sycl::range(1, 1, blocks) * t, t),
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+            native_q8_0_tile_kernel<NCOLS, Q8R_WARPS, Q8R_TILE_TAIL>(w, x, y, n_in, n_out);
+        });
+}
+
+inline bool q8_rows_on() {   // STRATA_MMVQ_Q8_ROWS=0: Q8_0 multi-column through the old wide32 kernel
+    static const bool v = std::getenv("STRATA_MMVQ_Q8_ROWS") == nullptr ||
+                          std::atoi(std::getenv("STRATA_MMVQ_Q8_ROWS")) != 0;
+    return v;
+}
+bool try_q8_0_rows(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                   void* stream) {
+    // ncols 1 stays on wide32: the single-column kernel is already weight-bandwidth bound.
+    if (!q8_rows_on() || !wide_32() || ncols < 2 || ncols > 8 || n_in <= 0 || n_out <= 0 || n_in % 32 != 0)
+        return false;
+    const auto s = strata::q_of(stream);
+    if (!q8r_available(s)) return false;
+    switch (ncols) {
+        case 2: launch_q8_0_rows<2>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 3: launch_q8_0_rows<3>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 4: launch_q8_0_rows<4>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 5: launch_q8_0_rows<5>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 6: launch_q8_0_rows<6>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        case 7: launch_q8_0_rows<7>(weights, x_q8_1, y, n_in, n_out, s); return true;
+        default: launch_q8_0_rows<8>(weights, x_q8_1, y, n_in, n_out, s); return true;
+    }
+}
+
 // SYCL port: alignment experiment - Q6_K blocks repacked at a 224-byte stride (every block 16-byte aligned).
 template <int NCOLS>
 void launch_q6k_wide224(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, dpct::queue_ptr s) {
@@ -4013,6 +4194,7 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
+    if (try_q8_0_rows(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     if (try_wide32<Wide32Q8>(weights, x_q8_1, y, n_in, n_out, ncols, stream)) { launch_check(); return; }
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
