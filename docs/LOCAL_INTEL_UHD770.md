@@ -261,6 +261,70 @@ for ~5 tokens of work; it would need **60%+ draft acceptance** just to break eve
 the block shows on real text even when it computes correctly.  The MTP is a correctness/debugging
 item here, not a performance win.
 
+### What limits MTP: measured costs, and the optimisations that follow
+
+`STRATA_Q36_SPEC_TIME=1` prints the per-step split.  With `--mtp 4` on a 4096 context, all experts
+in VRAM (12 steps, 22-token prompt):
+
+| part | per step | note |
+|---|---|---|
+| 4 MTP forwards + their heads | **77 ms** | ~19 ms each, one `st->wait()` each |
+| verify window (5 rows) | **445 ms** | 92% of the step |
+| other queue waits | ~77 ms | |
+| total | ~599 ms | yields `1 + accepted` tokens |
+
+The block itself is cheap; the verify window is the step.  And a 5-row window is not 5 tokens'
+worth of work but close to it.  A separate probe (`bwprobe`, 1 GiB buffers) puts the practical
+read bandwidth at **35 GB/s** (copy 44 GB/s read+write).  The batch curve from `--bench-pp`:
+
+| rows | ms per row |
+|---|---|
+| 1 | 130 |
+| 2 | 105 |
+| 4 | 87 |
+| 8 | 81 |
+| 16 | 80 |
+| 32 | 58 |
+| 512 | 40 |
+
+Decode moves ~3.1 GB per token (0.62 GB of routed experts + ~2.0 GB of dense layer weights + the
+0.54 GB output head), so 130 ms is **24 GB/s, about 68% of the measured read bandwidth**: plain
+decode is already close to the wall.  A 5-row window has a ~160 ms bandwidth floor and costs
+445 ms, so *small-batch verification* is the side with headroom (2.8x), and it is the same
+small-batch inefficiency that makes 1-16 rows cost 80-130 ms each.
+
+Break-even for D=4, `(D+1) x 87 ms` of verify plus ~100 ms of drafts and waits:
+
+| drafts accepted | tokens/step | ms/token | tok/s |
+|---|---|---|---|
+| 0 | 1 | 599 | 1.7 |
+| 2 | 3 | 200 | 5.0 |
+| 3 | 4 | 150 | 6.7 |
+| 4 | 5 | 120 | **8.3** |
+
+even *perfect* acceptance only reaches ~1.05x today.  That fixes the priority order:
+
+1. **Make small-batch verification efficient** (445 -> ~170 ms at the bandwidth floor).  This is
+   also what limits plain decode (130 vs ~89 ms) and prompt chunks, so it pays twice.
+2. **`--draft-vocab N`**: the draft's head is the full 0.54 GB Q8_0 output matrix, ~19 ms per
+   draft.  With `--draft-vocab 65536` the step's wait total fell from 930 to 671 ms over 12 steps
+   (the drafts are then ~5 ms), at the risk of only drafting low ids - a draft is only a proposal,
+   so the text is unchanged.
+3. **Keep the draft chain on the device**: `spec_step` copies `pick_m -> hpin -> tok_m` through
+   the host and waits after every draft (4 waits, ~77 ms/step).  `pick_m -> tok_m` is a
+   device-to-device copy; the acceptance check can wait once, after the verify window.
+4. **Fix the frozen chain first** - no tuning matters while it is broken.  The block predicts
+   507/511 on a constant prompt and agrees with the main model on 46% of a real-text prompt, but
+   the generation loop yields 0-7%, with the chained drafts stuck on the same four tokens.  A
+   debug build that waits before the MTP layer changes that, so it is an ordering problem in the
+   draft loop rather than an acceptance problem.
+5. **D=2 or 3, not 7**, once (1) is done: at the current per-row cost fewer drafts is strictly
+   better; D=7 only becomes right after the verify is ~2x cheaper.
+
+With (1) fixed at the bandwidth floor, the same D=4 table reads: 5 tokens for ~270 ms, i.e.
+~19 tok/s at perfect acceptance and ~9.5 tok/s at 50% - the regime where MTP is worth having.
+Until then, `--mtp` is a correctness item, not a performance one.
+
 ### Q3_K: the grouped expert dot was wrong
 
 `vec_dot_q3_K_q8_1` in the SYCL port unpacked Q3_K linearly (`qs[p/4]`, `hmask[p/8]`,
