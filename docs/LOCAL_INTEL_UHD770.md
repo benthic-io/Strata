@@ -330,7 +330,13 @@ even *perfect* acceptance only reaches ~1.05x today.  That fixes the priority or
 3. **Keep the draft chain on the device**: `spec_step` copies `pick_m -> hpin -> tok_m` through
    the host and waits after every draft (4 waits, ~77 ms/step).  `pick_m -> tok_m` is a
    device-to-device copy; the acceptance check can wait once, after the verify window.
-4. **Fix the frozen chain first** - no tuning matters while it is broken.  The block predicts
+4. **Fix the state corruption first** - no tuning matters while it is broken.  The same 22-token
+   prompt, `--n 8`, is deterministic (three runs, identical): plain greedy gives
+   `5802 5802 198 4868 5802 6994 52616 43832`, while `--mtp 4` gives
+   `5802 4868 36802 5802 4868 36802 5802 4868` - a three-token cycle.  A degenerate cycle means
+   the verify window / `commit()` is leaving the main model's K/V or GDN state wrong after a
+   speculative step, independently of whether any draft is accepted.  The frozen chained drafts
+   (same four tokens every step) are the same symptom from the MTP block's side.  The block predicts
    507/511 on a constant prompt and agrees with the main model on 46% of a real-text prompt, but
    the generation loop yields 0-7%, with the chained drafts stuck on the same four tokens.  A
    debug build that waits before the MTP layer changes that, so it is an ordering problem in the
