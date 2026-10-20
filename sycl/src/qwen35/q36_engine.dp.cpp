@@ -2741,7 +2741,7 @@ struct Engine {
             (K::native_q8_0_packed_eligible(a.n_in, a.n_out) && K::native_q8_0_packed_enabled()))
             return false;
         const int nb = a.n_in / 32;
-        const dpct::dim3 grid((unsigned)(FS / 16));
+        const dpct::dim3 grid((unsigned)(FS / 32));   // one 512-thread block per q8_1 block of 32 rows
         const bool pkd = false;
         const uint8_t* wa = a.d;
         const uint8_t* wb = b.d;
