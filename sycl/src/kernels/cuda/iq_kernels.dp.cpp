@@ -561,33 +561,38 @@ __dpct_inline__ float vec_dot_q5_K_q8_1(const void *__restrict__ vbq,
 __dpct_inline__ float vec_dot_q3_K_q8_1(const void *__restrict__ vbq,
                                         const block_q8_1 *__restrict__ bq8_1,
                                         const int &kbx, const int &iqs) {
-    const block_q3_K* bq3 = (const block_q3_K*) vbq + kbx;
-    const block_q8_1* bq8 = bq8_1 + iqs;
-    // Unpack the 12 scale bytes into 16 6-bit scales (ggml's scheme).
-    uint32_t auxs[4];
-    std::memcpy(auxs, bq3->scales, 12);
-    auxs[3] = 0;
-    const uint32_t tmp = auxs[2];
-    auxs[2] = ((auxs[0] >> 4) & 0x0f0f0f0f) | (((tmp >> 4) & 0x03030303) << 4);
-    auxs[3] = ((auxs[1] >> 4) & 0x0f0f0f0f) | (((tmp >> 6) & 0x03030303) << 4);
-    auxs[0] = (auxs[0] & 0x0f0f0f0f) | (((tmp >> 0) & 0x03030303) << 4);
-    auxs[1] = (auxs[1] & 0x0f0f0f0f) | (((tmp >> 2) & 0x03030303) << 4);
-    const int8_t* scales = (const int8_t*) auxs;
-    const float d = (float) *reinterpret_cast<const sycl::half*>(&bq3->d);
-    const float d8 = bq8->ds[0];
-    float sum = 0.0f;
-    const int base = iqs * 32;
-    for (int l = 0; l < 32; ++l) {
-        const int p = base + l;
-        const int low2 = (bq3->qs[p / 4] >> (2 * (p % 4))) & 3;
-        const int high = (bq3->hmask[p / 8] >> (p % 8)) & 1;
-        int q = low2 | (high << 2);
-        if (!high) q -= 4;
-        const int sc = (int) scales[p / 16] - 32;
-        const float act = d8 * (float) bq8->qs[l];
-        sum += d * (float) sc * (float) q * act;
+    // llama.cpp's vecdotq.cuh vec_dot_q3_K_q8_1 (MMVQ): iqs names one 16-value group of the 256 (QI3_K = 16),
+    // the group's four values coming from four q8_1 blocks at one word offset.  `vl` holds four 2-bit fields per
+    // byte, `vh` the INVERTED high-bit mask, and the saturating subtract maps 0..3 to -4..3.
+    const block_q3_K* bq3_K = (const block_q3_K*) vbq + kbx;
+    const int bq8_offset = QR3_K * (iqs / (QI3_K / 2));
+    const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+    const float d = (float) bq3_K->d;
+    const uint16_t* q16 = (const uint16_t*) bq3_K->qs;
+    const int vl = (int) q16[2 * iqs] | ((int) q16[2 * iqs + 1] << 16);
+    const uint16_t* h16 = (const uint16_t*) bq3_K->hmask;
+    const int hi = 2 * (iqs % (QI3_K / 2));
+    const int vh = ~((int) h16[hi] | ((int) h16[hi + 1] << 16)) >> bq8_offset;
+    int u[QR3_K];
+    float d8[QR3_K];
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        u[i] = ((const int*) (bq8_1[bq8_offset + i].qs))[iqs % QI8_1];
+        d8[i] = bq8_1[bq8_offset + i].ds[0];
     }
-    return sum;
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR3_K; ++i) {
+        const int isc = scale_offset + 2 * i;
+        const int sc_low = (bq3_K->scales[isc % 8] >> (4 * (isc / 8))) & 0xF;
+        const int sc_high = ((bq3_K->scales[8 + isc % 4] >> (2 * (isc / 4))) & 3) << 4;
+        const int sc = (sc_low | sc_high) - 32;
+        const int vil = (vl >> (2 * i)) & 0x03030303;
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+        const int vi = dpct::vectorized_binary<sycl::char4>(vil, vih, dpct::sub_sat());
+        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc);
+    }
+    return d * sumf;
 }
 
 // Q5_1: llama.cpp's integer chain, but the min term multiplies the sum of the QUANTIZED activations (dp4a with
