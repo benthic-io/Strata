@@ -1866,6 +1866,7 @@ struct Engine {
     std::vector<float*> v_qkv, v_hc, v_alpha, v_beta;
     // the MTP block (when loaded)
     float *mtp_cat = nullptr, *hmtp = nullptr, *logits_m = nullptr;
+    int32_t *draft_d = nullptr;   // spec_step: the chained drafts, one wait for all of them
     int32_t *tok_m = nullptr, *pos0_m = nullptr, *pick_m = nullptr;
     // graphs: [0] the decode step, [T] a verify window of T rows, mtp1 the MTP draft step
     // (the graphs hold the current session's state pointers as kernel arguments: one set per session)
@@ -2188,6 +2189,7 @@ struct Engine {
         tok = dalloc_t<int32_t>(T);
         pos0 = dalloc_t<int32_t>(1);
         pick = dalloc_t<int32_t>(kVerify);
+        draft_d = dalloc_t<int32_t>(kVerify);   // the draft chain's picks, copied device-to-device
         amv = dalloc((size_t) kArgBlocks * kVerify);
         ami = dalloc_t<int32_t>((size_t) kArgBlocks * kVerify);
         /*
@@ -2529,6 +2531,11 @@ struct Engine {
     /// rows) for T <= 8 columns: one warp per row (q36k::k_q8_rows) in place of the 4-warp block of
     /// native_small_mmvq_kernel; the same bits.
     bool q8_small(const Mat &w, const void *q, float *out, int T) try {
+        // The multi-column Q8_0 kernel in native_mmvq stages each column once and reads the weight words once,
+        // and measures 2-8% faster than this per-row path at T=1..8 on the UHD 770 (2.6% on a decode step).
+        // STRATA_Q36_Q8_SMALL=1 puts the per-row kernel back.
+        static const bool per_row = [] { const char* v = std::getenv("STRATA_Q36_Q8_SMALL"); return v && v[0] == '1'; }();
+        if (!per_row) return false;
         if (!fast_k || w.type != 8 || T < 1 || T > 8 || w.n_in % 32 != 0) return false;
         if (K::native_q8_0_packed_eligible(w.n_in, w.n_out) && K::native_q8_0_packed_enabled()) return false;
         const int nb = w.n_in / 32;
@@ -5579,20 +5586,11 @@ work-group size if needed.
         { const auto t = Clock::now(); forward_mtp(T0, pos - (int64_t) fix.size(), seeds, D > 0, false);
           sp_t[0] += ms_since(t); }
         drafts.assign((size_t) D, 0);
-        if (D > 0) {
-            /*
-            DPCT1124:154: cudaMemcpyAsync is migrated to asynchronous memcpy
-            API. While the origin API might be synchronous, it depends on the
-            type of operand memory, so you may need to call wait() on event
-            return by memcpy API to ensure synchronization behavior.
-            */
-            CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 2, pick_m, 4)));
-            { const auto t = Clock::now(); CK(DPCT_CHECK_ERROR(st->wait())); sp_t[2] += ms_since(t); }
-            drafts[0] = hpin[2];
-        }
+        // The draft chain runs entirely on the device: each pick goes to draft_d[d] and the next call reads
+        // draft_d[d-1] as its token, so there is ONE host wait for the whole chain instead of one per draft.
+        if (D > 0) CK(DPCT_CHECK_ERROR(st->memcpy(draft_d, pick_m, 4)));
         int last_row = T0 - 1;   // the row of the previous MTP call whose output seeds the next draft
         for (int d = 1; d < D; ++d) {   // chained: (the block's own output, the last draft) at the next position
-            hpin[0] = drafts[(size_t) d - 1];
             hpin[1] = (int32_t) (pos + d);
             /*
             DPCT1124:155: cudaMemcpyAsync is migrated to asynchronous memcpy
@@ -5600,7 +5598,7 @@ work-group size if needed.
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
             */
-            CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, hpin, 4)));
+            CK(DPCT_CHECK_ERROR(st->memcpy(tok_m, draft_d + (d - 1), 4)));
             /*
             DPCT1124:156: cudaMemcpyAsync is migrated to asynchronous memcpy
             API. While the origin API might be synchronous, it depends on the
@@ -5627,9 +5625,13 @@ work-group size if needed.
             type of operand memory, so you may need to call wait() on event
             return by memcpy API to ensure synchronization behavior.
             */
-            CK(DPCT_CHECK_ERROR(st->memcpy(hpin + 2, pick_m, 4)));
+            CK(DPCT_CHECK_ERROR(st->memcpy(draft_d + d, pick_m, 4)));
+        }
+        if (D > 0) {   // the one wait: the whole chain's picks come back together (hpin is USM host; a
+                       // std::vector is pageable and must not be passed to queue::memcpy)
+            CK(DPCT_CHECK_ERROR(st->memcpy(hpin, draft_d, (size_t) D * 4)));
             { const auto t = Clock::now(); CK(DPCT_CHECK_ERROR(st->wait())); sp_t[2] += ms_since(t); }
-            drafts[(size_t) d] = hpin[2];
+            for (int d = 0; d < D; ++d) drafts[(size_t) d] = hpin[d];
         }
         // the verify window
         const int T = D + 1;

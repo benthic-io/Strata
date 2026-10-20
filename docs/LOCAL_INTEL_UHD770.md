@@ -240,113 +240,67 @@ for long context.
 - Dropping `IGC_EnableDPEmulation=1 OverrideDefaultFP64Settings=1`: the run is not faster and
   the greedy text changes (the rope and QK paths use doubles), so the flags stay.
 
-### Speculative decoding: the block computes now, the draft loop does not
+### Speculative decoding: the shared expert made it T-dependent
 
-The Q3_K expert kernel was wrong in a way that made the MTP block produce noise (see the section
-below).  With that fixed, the block's own predictions are right: fed a constant prompt it agrees
-with the main model on **507 of 511** rows (it was 0 of 511 before the fix), and the `hmtp` /
-logits / argmax chain is consistent.
+`--mtp` is now lossless and, on this GPU, slightly faster than plain greedy:
 
-The draft loop around it still is not usable.  On real text the first draft is usually wrong, and
-the chained drafts freeze at the same four tokens (598, 11113, 81842, 79874) on every step even
-though `tok_m`, `pos0_m` and the seed all change; with `--mtp 4` that is 0 of 124 accepted and
-1.9 tok/s against 7.9 without.  A debug build that waits on the queue inside the step gets 5 of 40
-(12%), so this is a synchronization/state bug in the MTP path (the block's own K/V or the chained
-seed), not in the expert kernel.  Leave `--mtp` off; the plain greedy decode is unaffected.
-
-Even with the loop fixed, the arithmetic on this GPU is unfavourable: a verify window of 5 rows
-costs about five single-token steps (decode here is latency-bound, not batching-bound), and the
-four MTP forwards add the rest.  At the 12% the loop reaches today a spec step produces 1.1 tokens
-for ~5 tokens of work; it would need **60%+ draft acceptance** just to break even, against the 46%
-the block shows on real text even when it computes correctly.  The MTP is a correctness/debugging
-item here, not a performance win.
-
-### What limits MTP: measured costs, and the optimisations that follow
-
-`STRATA_Q36_SPEC_TIME=1` prints the per-step split.  With `--mtp 4` on a 4096 context, all experts
-in VRAM (12 steps, 22-token prompt):
-
-| part | per step | note |
+| run | tok/s | acceptance |
 |---|---|---|
-| 4 MTP forwards + their heads | **77 ms** | ~19 ms each, one `st->wait()` each |
-| verify window (5 rows) | **445 ms** | 92% of the step |
-| other queue waits | ~77 ms | |
-| total | ~599 ms | yields `1 + accepted` tokens |
+| plain | 7.8 | - |
+| `--mtp 1 --draft-vocab 65536` | **8.1** | 28/35 (80%) |
+| `--mtp 1 --draft-vocab 65536`, second prompt | 7.9 | 13/18 (72%) |
+| `--mtp 2 --draft-vocab 65536` | 7.4 | 67% |
+| `--mtp 3 --draft-vocab 65536` | 6.0 | 51% |
 
-The block itself is cheap; the verify window is the step.  And a 5-row window is not 5 tokens'
-worth of work but close to it.  A separate probe (`bwprobe`, 1 GiB buffers) puts the practical
-read bandwidth at **35 GB/s** (copy 44 GB/s read+write).  The batch curve from `--bench-pp`:
+D=1 is the sweet spot: the three-row verify cost of D=2 is not repaid by the extra draft.  The
+plain and `--mtp` token lists are identical on both prompts (verified 64 and 32 tokens).
 
-| rows | ms per row |
-|---|---|
-| 1 | 130 |
-| 2 | 105 |
-| 4 | 87 |
-| 8 | 81 |
-| 16 | 80 |
-| 32 | 58 |
-| 512 | 40 |
+What was wrong is worth recording, because it was invisible from the outside.  `k_sh_gu` (the
+shared expert's fused gate+up+SwiGLU+q8_1 kernel) had been adapted to this GPU's 512-thread
+work-group limit - the CUDA original uses 1024 - by halving the block and doubling the grid, but
+its row -> q8_1 mapping still assumed 32 warps per block.  A block computed 16 rows and filled a
+32-element q8 block from them plus 16 uninitialised shared lanes, and each column wrote twice its
+share, overrunning into the next column's image.  The shared-expert output therefore depended on
+the row count: a plain token (T=1), a verify window (T=2..5) and the MTP block's own layer fed the
+MoE different values.  That single bug produced every symptom - 0% acceptance, "frozen" chained
+drafts, and the 3-token cycle the main model fell into after a speculative step.  Each warp now
+computes rows `32b + w` and `32b + w + 16` of one 32-row block and the grid is `n_out/32` again;
+the fast path then matches `STRATA_Q36_OLD_KERNELS=1` bit for bit.
 
-Decode moves ~3.1 GB per token (0.62 GB of routed experts + ~2.0 GB of dense layer weights + the
-0.54 GB output head), so 130 ms is **24 GB/s, about 68% of the measured read bandwidth**: plain
-decode is already close to the wall.  A 5-row window has a ~160 ms bandwidth floor and costs
-445 ms, so *small-batch verification* is the side with headroom (2.8x), and it is the same
-small-batch inefficiency that makes 1-16 rows cost 80-130 ms each.
+### Multi-column Q8_0 MMVQ: 2.1-2.9x
 
-Break-even for D=4, `(D+1) x 87 ms` of verify plus ~100 ms of drafts and waits:
+The verify window and the draft head are small-batch Q8_0 projections.  `native_mmvq` read the
+weight words once but the activation columns once per output row, so 8 columns cost ~8x.  Two new
+kernels (`native_q8_0_rows_kernel` for `n_in <= 2048`, `native_q8_0_tile_kernel` for longer rows)
+stage the columns in local memory once and reuse them across rows:
 
-| drafts accepted | tokens/step | ms/token | tok/s |
+| ncols | before | after | weight bandwidth |
 |---|---|---|---|
-| 0 | 1 | 599 | 1.7 |
-| 2 | 3 | 200 | 5.0 |
-| 3 | 4 | 150 | 6.7 |
-| 4 | 5 | 120 | **8.3** |
+| 1 | 0.153 ms | 0.153 ms (unchanged path) | 29 GB/s |
+| 2 | 0.199 | 0.104 (1.92x) | 43 GB/s |
+| 4 | 0.333 | 0.142 (2.35x) | 31 GB/s |
+| 5 | 0.400 | 0.156 (2.56x) | 29 GB/s |
+| 8 | 0.652 | 0.223 (2.92x) | 20 GB/s |
 
-even *perfect* acceptance only reaches ~1.05x today.  That fixes the priority order:
+(2048x2048 Q8_0, the model's attention/GDN shape; with the engine's own link flags the gain is
+2.1-2.3x.)  Output is bitwise identical (`native_mmvq_q8_parity`, 0 differing outputs for ncols
+1..8 over four shapes; ncols 1 keeps its old kernel).  The engine now routes its Q8_0 T <= 8
+projections through it by default - +2.6% on a plain decode step - with `STRATA_Q36_Q8_SMALL=1`
+restoring the per-row kernel.  It does not change pp512 (24.9 tok/s): a prompt chunk is T > 8 and
+takes the fp16 GEMM, not MMVQ.
 
-1. **Make small-batch verification efficient** (445 -> ~170 ms at the bandwidth floor).  This is
-   also what limits plain decode (130 vs ~89 ms) and prompt chunks, so it pays twice.
+### What limits MTP, measured
 
-   The microbenchmarks put the cause on the multi-column dense projection.  A 2048x2048 Q8_0
-   matrix (4.46 MB, the shape every attention/GDN projection has) through `native_mmvq`:
+`STRATA_Q36_SPEC_TIME=1` splits a speculative step.  With D=2, 4096 context, all experts in VRAM:
+MTP forwards+heads 21 ms, verify window (3 rows) 293 ms, queue waits 42 ms - 353 ms per step.
 
-   | ncols | ms | per column | weight bandwidth |
-   |---|---|---|---|
-   | 1 | 0.158 | 0.158 | 28.3 GB/s |
-   | 2 | 0.199 | 0.100 | 22.4 GB/s |
-   | 4 | 0.334 | 0.084 | 13.4 GB/s |
-   | 8 | 0.652 | 0.082 | 6.8 GB/s |
-
-   The kernel amortises the weight read only ~2x from 1 to 8 columns; per-column time halves and
-   then stops.  At the verify window's 5 columns it runs at **11 GB/s of weight traffic** against
-   the 35 GB/s the memory can do, and that is the 445 ms.  The obvious alternative, the fp16 GEMM
-   (`Gemm::native`), is **4x slower** at these sizes (T=5: 1.49 ms against 0.40 ms), so the fix has
-   to be a better multi-column MMVQ, not a path switch.  The same kernel sets pp512 (ncols 8,
-   6.8 GB/s), so improving it pays on prompts too.
-2. **`--draft-vocab N`**: the draft's head is the full 0.54 GB Q8_0 output matrix, ~19 ms per
-   draft.  With `--draft-vocab 65536` the step's wait total fell from 930 to 671 ms over 12 steps
-   (the drafts are then ~5 ms), at the risk of only drafting low ids - a draft is only a proposal,
-   so the text is unchanged.
-3. **Keep the draft chain on the device**: `spec_step` copies `pick_m -> hpin -> tok_m` through
-   the host and waits after every draft (4 waits, ~77 ms/step).  `pick_m -> tok_m` is a
-   device-to-device copy; the acceptance check can wait once, after the verify window.
-4. **Fix the state corruption first** - no tuning matters while it is broken.  The same 22-token
-   prompt, `--n 8`, is deterministic (three runs, identical): plain greedy gives
-   `5802 5802 198 4868 5802 6994 52616 43832`, while `--mtp 4` gives
-   `5802 4868 36802 5802 4868 36802 5802 4868` - a three-token cycle.  A degenerate cycle means
-   the verify window / `commit()` is leaving the main model's K/V or GDN state wrong after a
-   speculative step, independently of whether any draft is accepted.  The frozen chained drafts
-   (same four tokens every step) are the same symptom from the MTP block's side.  The block predicts
-   507/511 on a constant prompt and agrees with the main model on 46% of a real-text prompt, but
-   the generation loop yields 0-7%, with the chained drafts stuck on the same four tokens.  A
-   debug build that waits before the MTP layer changes that, so it is an ordering problem in the
-   draft loop rather than an acceptance problem.
-5. **D=2 or 3, not 7**, once (1) is done: at the current per-row cost fewer drafts is strictly
-   better; D=7 only becomes right after the verify is ~2x cheaper.
-
-With (1) fixed at the bandwidth floor, the same D=4 table reads: 5 tokens for ~270 ms, i.e.
-~19 tok/s at perfect acceptance and ~9.5 tok/s at 50% - the regime where MTP is worth having.
-Until then, `--mtp` is a correctness item, not a performance one.
+A separate probe puts the practical read bandwidth at **35 GB/s** (44 GB/s read+write), and
+`--bench-pp` gives the per-row cost: 1 row 130 ms, 2 rows 107, 4 rows 90, 8 rows 81, 16 rows 80,
+32 rows 58, 512 rows 40.  Decode moves ~3.1 GB per token, so a plain token is already at ~24 GB/s
+(68% of the read bandwidth); a 3-row verify has a ~130 ms bandwidth floor and costs 293 ms.  That
+is why D=1 wins: the second draft's extra row costs more than the draft saves.  The remaining
+headroom is in small-batch verification (2.2x to the floor), and it is the same inefficiency that
+makes 2-16 row chunks cost 80-107 ms per row.
 
 ### Q3_K: the grouped expert dot was wrong
 
